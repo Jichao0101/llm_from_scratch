@@ -33,6 +33,7 @@
 import torch
 from torch import nn as nn
 from torch.nn import functional as F
+import copy
 
 torch.manual_seed(42)
 
@@ -40,9 +41,6 @@ vocab_size = 8
 d_model = 32
 nhead = 4
 num_layers = 1
-
-max_epoch = 1000
-loss_thresh = 0.1
 
 
 class TinyCausalLM(nn.Module):
@@ -90,18 +88,7 @@ def train_step(
 	shift_labels = labels[:, 1:]
 	loss =F.cross_entropy(shift_logits.view(-1, vocab_size), shift_labels.view(-1), ignore_index=-100)
 	loss.backward()
-
-
-	total_norm = 0.0
-
-	for p in model.parameters():
-		if p.grad is not None:
-			param_norm = p.grad.data.norm(2)
-			total_norm += (
-                param_norm.item()
-                ** 2
-            )
-	grad_norm = total_norm ** 0.5
+	grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float("inf"))
 
 	optimizer.step()
 
@@ -122,17 +109,20 @@ def evaluate_single_batch(
 		logits = model(input_ids, attention_mask)
 		shift_logits = logits[:, :-1, :]
 		shift_labels = labels[:, 1:]
-		loss = F.cross_entropy(shift_logits.view(-1, vocab_size), shift_labels.view(-1), ignore_index=-100, reduction="sum")
+		mask = shift_labels != -100
+		valid_tokens = mask.sum()
+		if valid_tokens == 0:
+			raise ValueError("No valid target tokens found: all labels are ignored by ignore_index=-100")
+		loss = F.cross_entropy(shift_logits.view(-1, vocab_size), shift_labels.view(-1), ignore_index=-100, reduction="mean")
 		cls = torch.argmax(shift_logits, dim=2)
-		correct_tokens = torch.sum(cls == shift_labels)
-		valid_tokens = torch.sum(shift_labels != -100)
-		token_accuray = correct_tokens / valid_tokens
+		correct_tokens = torch.sum(cls[mask] == shift_labels[mask])
+		token_accuracy = correct_tokens / valid_tokens if valid_tokens != 0  else 0
 
 	if was_training:
 		model.train()
-	return loss, correct_tokens, valid_tokens, token_accuray
+	return loss, correct_tokens, valid_tokens, token_accuracy
 
-def main():
+def overfit():
 	model = TinyCausalLM()
 	optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 	
@@ -140,6 +130,9 @@ def main():
 	input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 0]]) # [1, 8]
 	attention = torch.tensor([[1, 1, 1, 1, 1, 1 ,1, 0]]) # [1, 8]
 	labels = torch.tensor([[-100, -100, -100, -100, 5, 6, 7, -100]])
+
+	max_epoch = 1000
+	loss_thresh = 0.1
 
 	for i in range(max_epoch):
 		metrics = train_step(model, optimizer=optimizer, input_ids=input_ids, labels=labels, attention_mask=attention)
@@ -153,8 +146,73 @@ def main():
 	print("max epoch arrived")
 
 
+'''
+ K = 20，M = 5
+  1. 训练 K 步并保存 checkpoint
+  2. 原分支继续 M 步，保存每步 metrics
+  3. 克隆原分支最终参数
+  4. 新建并恢复 model/optimizer/RNG
+  5. 恢复分支训练 M 步
+  6. 输出：
+     - max_loss_diff
+     - max_grad_norm_diff
+     - max_lm_head_delta_diff
+     - max_param_abs_diff
+
+'''
+def recover_trajectory():
+	model = TinyCausalLM()
+	optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+	locations = ["BOS", "SYS", "USER", "ASSIST", "A", "B", "EOS", "PAD"]
+	input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 0]]) # [1, 8]
+	attention = torch.tensor([[1, 1, 1, 1, 1, 1 ,1, 0]]) # [1, 8]
+	labels = torch.tensor([[-100, -100, -100, -100, 5, 6, 7, -100]])
+
+	K = 20
+	M = 5
+
+	for _ in range(K):
+		train_step(model, optimizer=optimizer, input_ids=input_ids, labels=labels,  attention_mask=attention)
+	checkpoint = {
+		"model": copy.deepcopy(model.state_dict()),
+		"optimizer": copy.deepcopy(optimizer.state_dict()),
+		"RNG": copy.deepcopy(torch.get_rng_state())
+	}
+
+	reference_metrics = []
+
+	for _ in range(M):
+		metrics = train_step(model, optimizer=optimizer, input_ids=input_ids, labels=labels,  attention_mask=attention)
+		reference_metrics.append(metrics)
+
+	reference_params = {name: param.detach().clone() for name, param in model.named_parameters()}
+
+	# resume training
+
+	model = TinyCausalLM()
+	optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+	model.load_state_dict(checkpoint["model"])
+	optimizer.load_state_dict(checkpoint["optimizer"])
+	torch.set_rng_state(checkpoint["RNG"])
+
+	max_loss_diff = 0
+	max_grad_norm_diff = 0
+	max_lm_head_delta_diff = 0
+	for i in range(M):
+		metrics = train_step(model, optimizer=optimizer, input_ids=input_ids, labels=labels,  attention_mask=attention)
+		max_loss_diff = max(max_loss_diff, abs(metrics["loss"] - reference_metrics[i]["loss"]))
+		max_grad_norm_diff = max(max_grad_norm_diff, abs(metrics["grad_norm"] - reference_metrics[i]["grad_norm"]))
+		max_lm_head_delta_diff = max(max_lm_head_delta_diff, abs(metrics["lm_head_delta"] - reference_metrics[i]["lm_head_delta"]))
+	max_param_abs_diff = 0
+	for name, param in model.named_parameters():
+		diff = (param.detach() - reference_params[name]).abs().max()
+		max_param_abs_diff = max(max_param_abs_diff, diff)
+	print(max_loss_diff, max_grad_norm_diff, max_lm_head_delta_diff, max_param_abs_diff)
+	
+
 if __name__ == "__main__":
-	main()
+	recover_trajectory()
 
 
 
