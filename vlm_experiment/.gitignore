@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+runs/
+datasets/
+artifacts/
+extract_data/
