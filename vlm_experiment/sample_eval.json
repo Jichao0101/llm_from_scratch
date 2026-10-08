@@ -1,0 +1,41 @@
+{
+  "dataset": "extract_data",
+  "out": "runs/sample_eval_benchmark_v1",
+  "model": "/workspace/dms-eye-status-turbo/qwen_models/Qwen3.5-9B",
+  "mode": "benchmark",
+  "sample_count": 128,
+  "sample_seed": 20261008,
+  "sample_manifest": null,
+  "batch_sizes": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32
+  ],
+  "gpu": "0",
+  "warmup_batches": 2,
+  "repeats": 3,
+  "context_budget": 5600,
+  "max_new_tokens": 256,
+  "seed": 42,
+  "cpu_threads_per_worker": 4,
+  "dp": {
+    "enabled": false,
+    "gpus": [
+      "0",
+      "1",
+      "2",
+      "3"
+    ],
+    "batch_size": 8
+  },
+  "profiler": {
+    "batch_size": 8,
+    "batches": 3,
+    "record_shapes": true,
+    "profile_memory": true,
+    "with_stack": false
+  }
+}
