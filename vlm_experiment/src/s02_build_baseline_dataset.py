@@ -44,7 +44,7 @@ BUILD_SETTINGS = {
         "68": "FA-The-68th-batch-delivery-20260124",
         "70": "FA-The-70th-batch-delivery",
         "71": "FA-The-71st-batch-delivery-20260204",
-        "77": "FA-The-75st-batch-delivery-20260228",
+        "75": "FA-The-75st-batch-delivery-20260228",
         "77": "FA-The-77st-batch-delivery-20260307",
         "79": "FA-The-79st-batch-delivery-20260314"
     }
