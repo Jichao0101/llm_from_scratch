@@ -1,7 +1,7 @@
 """按脚本内设置的批次相对目录构建冻结清单，不依赖交付目录名称格式。
 
 图片与同名JSON留在原处；manifest保存图片/标注绝对路径、内容hash及两种坐标GT。
-完整会话目录不可跨集合；任一眼hard整图排除，其他读取错误使构建失败。
+完整会话目录不可跨集合；hard及缺失/非法标注整图排除，其他读取错误使构建失败。
 """
 import argparse
 from collections import Counter, defaultdict
@@ -25,11 +25,11 @@ BUILD_SETTINGS = {
     "purpose": "formal_baseline",
     "splits": {
         "train": [
-            # 67,
-            # 68,
-            # 70,
+            67,
+            68,
+            70,
             71,
-            # 75
+            75
         ],
         "val": [
             77
@@ -40,12 +40,12 @@ BUILD_SETTINGS = {
     },
     "hard_policy": "exclude_image",
     "batch_dirs": {
-        # "67": None,
-        # "68": None,
-        # "70": None,
+        "67": "FA-The-67th-batch-delivery-20260116",
+        "68": "FA-The-68th-batch-delivery-20260124",
+        "70": "FA-The-70th-batch-delivery",
         "71": "FA-The-71st-batch-delivery-20260204",
-        "77": "FA-The-77st-batch-delivery-20260228",
-        # "77": None,
+        "77": "FA-The-75st-batch-delivery-20260228",
+        "77": "FA-The-77st-batch-delivery-20260307",
         "79": "FA-The-79st-batch-delivery-20260314"
     }
 }
@@ -67,29 +67,54 @@ def atomic_json(path, value):
 
 
 def read_gt(path):
-    """返回像素GT；任一眼hard则排除整图，其他未知标签或非双眼标注报错。"""
-    data = json.loads(Path(path).read_text(encoding='utf-8-sig'))
-    items = [item for item in data['dataList'] if 'eye_status' in item.get('properties', {})]
-    # hard是整图排除条件，先于双眼数量检查；它不等同于状态不可判定的occluded。
+    """返回(像素GT, 排除原因)；可用时原因为None，不可用时GT为None。
+
+    标注内容缺失/非法属于整图排除；权限、磁盘等IO异常继续抛出，不能伪装成坏标注。
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    except FileNotFoundError:
+        return None, 'missing_annotation_file'
+    except (json.JSONDecodeError, UnicodeError):
+        return None, 'invalid_annotation_json'
+    if not isinstance(data, dict):
+        return None, 'invalid_annotation_structure'
+    entries = data.get('dataList')
+    if entries is None or entries == []:
+        return None, 'missing_eye_labels'
+    if not isinstance(entries, list):
+        return None, 'invalid_annotation_structure'
+    items = [item for item in entries if isinstance(item, dict)
+             and isinstance(item.get('properties'), dict) and 'eye_status' in item['properties']]
+    # hard优先作为整图排除原因，不需要再检查无法定位的眼框。
     if any(item['properties']['eye_status'] == 'hard' for item in items):
-        return None
-    if len(items) != 2:
-        raise ValueError(f'Expected two localized eyes, got {len(items)}')
+        return None, 'hard_on_at_least_one_eye'
+    if len(items) < 2:
+        return None, 'missing_eye_labels'
+    if len(items) > 2:
+        return None, 'invalid_eye_count'
     eyes = {}
     for item in items:
         side = EYE_ID_TO_SIDE.get(str(item.get('id')))
         if side is None or side in eyes:
-            raise ValueError('Expected unique eye annotation IDs 1 and 2')
-        state = LABELS[item['properties']['eye_status']]
-        (x1, y1), (x2, y2) = item['coordinates']
+            return None, 'invalid_eye_ids'
+        label = item['properties']['eye_status']
+        if label is None or label == '':
+            return None, 'missing_eye_labels'
+        if not isinstance(label, str) or label not in LABELS:
+            return None, 'invalid_eye_label'
+        try:
+            (x1, y1), (x2, y2) = item['coordinates']
+        except (KeyError, TypeError, ValueError):
+            return None, 'invalid_eye_box'
+        if not all(type(v) in (int, float) and math.isfinite(v) for v in (x1, y1, x2, y2)):
+            return None, 'invalid_eye_box'
+        # 原始两点标注允许角点反序；零面积框和非数值坐标不能用于训练或评分。
         box = [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
-        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in box):
-            raise ValueError('Nonfinite GT coordinates')
         if box[0] >= box[2] or box[1] >= box[3]:
-            raise ValueError('Degenerate GT cannot be scored')
-        eyes[side] = {'bbox': box, 'state': state}
-    # 标注列表顺序不影响左右；框和状态始终归属同一ID，不用几何排序修正标注。
-    return {side: eyes[side] for side in SIDES}
+            return None, 'invalid_eye_box'
+        eyes[side] = {'bbox': box, 'state': LABELS[label]}
+    return {side: eyes[side] for side in SIDES}, None
 
 
 def normalize_gt(gt, width, height):
@@ -105,7 +130,7 @@ def build_dataset(root, out, observed_list=None):
     """按批次划分扫描全量图片，返回构建报告并写入新的out目录。
 
     BUILD_SETTINGS中的splits决定批次用途，batch_dirs明确各批次相对root的位置。
-    配置错误在创建输出前抛出；样本错误汇总为failed报告，不发布manifest。
+    配置错误在创建输出前抛出；坏标注进入exclusions，IO或划分错误进入failed报告。
     observed_list记录已看过的诊断图片相对路径，用于防止污染最终测试集。
     """
     config = BUILD_SETTINGS
@@ -174,9 +199,9 @@ def build_dataset(root, out, observed_list=None):
             try:
                 if root not in image.resolve().parents or root not in annotation.resolve().parents:
                     raise ValueError('Source path escapes data root')
-                gt = read_gt(annotation)
-                if gt is None:
-                    exclusions.append({'image': image.resolve().as_posix(), 'split': split, 'batch': batch, 'reason': 'hard_on_at_least_one_eye'})
+                gt, exclusion_reason = read_gt(annotation)
+                if exclusion_reason:
+                    exclusions.append({'image': image.resolve().as_posix(), 'annotation': annotation.resolve().as_posix(), 'split': split, 'batch': batch, 'reason': exclusion_reason})
                     continue
                 # 会话内图片与JSON同级；人员数字前缀只用于统计，不作为split隔离键。
                 match = re.match(r'^(\d+)_', image.parent.name)
@@ -185,6 +210,21 @@ def build_dataset(root, out, observed_list=None):
                 person = match[1]
                 with Image.open(image) as decoded:
                     width, height = decoded.size  # 保留存储像素方向；忽略JSON尺寸与EXIF旋转。
+                target = normalize_gt(gt, width, height)
+                # 越界框或量化后退化的框同样不可用；排除而不裁剪/扩大GT。
+                exclusion_reason = None
+                for side in SIDES:
+                    x1, y1, x2, y2 = gt[side]['bbox']
+                    nx1, ny1, nx2, ny2 = target[side]['bbox']
+                    if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+                        exclusion_reason = 'eye_box_out_of_bounds'
+                        break
+                    if not (0 <= nx1 < nx2 <= 1000 and 0 <= ny1 < ny2 <= 1000):
+                        exclusion_reason = 'invalid_norm1000_box'
+                        break
+                if exclusion_reason:
+                    exclusions.append({'image': image.resolve().as_posix(), 'annotation': annotation.resolve().as_posix(), 'split': split, 'batch': batch, 'reason': exclusion_reason})
+                    continue
                 image_hash = sha256_file(image)
                 persons[person].add(split)
                 # 完整场景目录为group；去掉交付批次前缀，识别同一场景重复交付。
@@ -200,7 +240,7 @@ def build_dataset(root, out, observed_list=None):
                     'batch': batch, 'split': split, 'person_id': person, 'session_group': session_group, 'session': image.parent.relative_to(root).as_posix(),
                     'scenario': image.parent.name.rsplit('_', 1)[-1], 'width': width, 'height': height,
                     'observed_diagnostic': relative in observed,
-                    'gt_pixel': gt, 'target_norm1000': normalize_gt(gt, width, height)})
+                    'gt_pixel': gt, 'target_norm1000': target})
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 errors.append({'image': image.resolve().as_posix(), 'split': split, 'error': f'{type(exc).__name__}: {exc}'})
     # 同一人员不同会话可以跨集合；同一会话或完全相同图片跨集合则拒绝构建。
@@ -240,13 +280,14 @@ def build_dataset(root, out, observed_list=None):
         'observed_list_sha256': sha256_file(observed_list) if observed_list else None,
         'diagnostic_overlap_reviewed': bool(observed_list or config.get('diagnostic_overlap_review')),
         'scanned_images': dict(scanned), 'excluded_images': len(exclusions),
+        'excluded_by_reason': dict(Counter(x['reason'] for x in exclusions)),
         'excluded_by_split': dict(Counter(x['split'] for x in exclusions)),
         'error_count': len(errors), 'manifests': manifests,
         'person_overlap_across_splits': {person: sorted(owners) for person, owners in sorted(persons.items()) if len(owners)>1},
         'person_overlap_is_error': False, 'split_group': 'session_directory',
         'builder_sha256': sha256_file(__file__),
         'coordinate_contract': {'gt_pixel': 'original_image_pixel_xyxy', 'target_norm1000': 'integer_xyxy_0_1000', 'rounding': 'ties_to_even'},
-        'scope': 'paired localized eyes; hard images excluded; complete session directories isolated; same-person different-session overlap allowed and reported; cross-scene evaluation, not unseen-person generalization'}
+        'scope': 'paired localized eyes; hard and missing/invalid annotation images excluded; complete session directories isolated; same-person different-session overlap allowed and reported; cross-scene evaluation, not unseen-person generalization'}
     atomic_json(out/'dataset.json', report)
     return report
 

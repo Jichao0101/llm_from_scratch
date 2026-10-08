@@ -19,7 +19,7 @@ manifest schema v4中，`gt_pixel`保存原图浮点像素GT，`target_norm1000`
 - 完整会话目录是场景group，不能拆到不同集合。同一人员ID的不同会话允许跨集合；人员重叠只报告，不报错。
 - group 使用批次目录下的完整相对会话路径，避免同一目录重复交付到不同批次后漏检。不按 `NorDrv` 等类别名合并独立会话。
 - 任一眼为 `hard`，整张图排除，并写入 `exclusions.json`。hard表示可能无法定位眼睛，不映射为occluded。
-- 四类映射：eye_open/eye_closed/eye_narrow/eye_occluded → open/closed/narrow/occluded。未知标签、非双眼、ID缺失/重复/非法及缺图/缺标注报错，不能静默丢弃。
+- 四类映射：eye_open/eye_closed/eye_narrow/eye_occluded → open/closed/narrow/occluded。缺失JSON/眼标签、非法JSON结构、未知标签、非双眼、非法ID、非法/越界/量化后退化框均整图排除，记录图片、标注路径及具体原因；不补框或修正GT。
 - 按实际图片尺寸读取像素GT，标注`id=2`（驾驶员右眼）映射为`image_left_eye`，`id=1`（驾驶员左眼）映射为`image_right_eye`，不按框中心排序。模型输出norm1000整数xyxy，验证0..1000后转换一次到像素评分；不裁剪、不旋转、不修正预测左右。
 - 跨集合完全相同的图片内容仍报错。文件hash不等于近重复检测；原始视频有不同编码或不同拷贝路径时，需保证采集组身份约定成立。
 
@@ -38,7 +38,7 @@ python src/build_baseline_dataset.py \
 要求代码中选择的批次目录均存在且不相互重叠，完整递归收集，不随机采样。图片无需复制。批次目录以下层级沿用原始结构，图片及同名JSON直接位于会话目录；人员统计仍使用会话名的数字前缀。
 生成 `train.jsonl`、`val.jsonl`、`test.jsonl`、`dataset.json`、`exclusions.json`、`build_errors.json`。
 `dataset.json` 包含各split图片/眼睛四类/人员/会话/场景数量、人员交叠及manifest hash。
-构建错误时保留错误报告，不发布可用manifest。输出目录存在会拒绝覆盖。
+`exclusions.json`记录不可用样本，`dataset.json.excluded_by_reason`按原因汇总；这些排除不导致构建失败。权限/图片读取错误、孤立JSON缺图、目录/划分错误、跨集合重复和排除后空集合仍记为构建错误，不发布可用manifest。输出目录存在会拒绝覆盖。
 
 既有40图已用于诊断，正式比较前需要明确其与各集合的关系：可提供 `--observed-list observed_images.txt`，文件每行是相对数据根目录的图片路径。传入的列表应覆盖已知诊断样例；测试集出现这类样本会报错。若在其他流程完成核对，可在脚本 `BUILD_SETTINGS` 的 `diagnostic_overlap_review` 填写实际依据。未核对时仍能构建和推理，但报告保持 `diagnostic_overlap_reviewed=false`，不自动声明正式baseline就绪。
 
