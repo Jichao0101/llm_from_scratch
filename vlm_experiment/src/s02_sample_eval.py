@@ -74,17 +74,16 @@ def read_config(path):
     if missing:
         raise ValueError('Missing config fields: ' + ', '.join(sorted(missing)))
     mode = config['mode']
-    if mode not in ('prepare', 'benchmark', 'profile'):
-        raise ValueError('mode must be prepare, benchmark or profile')
+    if mode not in ('benchmark', 'profile'):
+        raise ValueError('mode must be benchmark or profile')
     if config['sample_count'] < 1:
         raise ValueError('sample_count must be positive')
-    if mode != 'prepare':
-        if min(config[k] for k in ('warmup_batches', 'context_budget', 'max_new_tokens', 'cpu_threads_per_worker')) < 1:
-            raise ValueError('Warmup, token budgets and CPU threads must be positive')
-        if config['max_new_tokens'] >= config['context_budget']:
-            raise ValueError('max_new_tokens must be smaller than context_budget')
-        if not config['gpu'] or ',' in config['gpu']:
-            raise ValueError('gpu must identify exactly one GPU')
+    if min(config[k] for k in ('warmup_batches', 'context_budget', 'max_new_tokens', 'cpu_threads_per_worker')) < 1:
+        raise ValueError('Warmup, token budgets and CPU threads must be positive')
+    if config['max_new_tokens'] >= config['context_budget']:
+        raise ValueError('max_new_tokens must be smaller than context_budget')
+    if not config['gpu'] or ',' in config['gpu']:
+        raise ValueError('gpu must identify exactly one GPU')
     if mode == 'benchmark':
         sizes = config['batch_sizes']
         if not sizes or sizes[0] != 1 or min(sizes) < 1 or sizes != sorted(set(sizes)) or config['repeats'] < 1:
@@ -443,9 +442,9 @@ def main():
     args = parser.parse_args()
     config = read_config(args.config)
     meta, rows = load_dataset(config['dataset'], 'val')  
-    if config['mode'] != 'prepare' and meta['purpose'] != 'formal_baseline':
+    if meta['purpose'] != 'formal_baseline':
         raise ValueError('GPU experiments require a formal_baseline manifest')
-    if config['mode'] != 'prepare' and not Path(config['model']).is_dir():
+    if not Path(config['model']).is_dir():
         raise ValueError('Expected a local model directory; update config.model for this environment')
     if config['sample_manifest']:
         frozen = [json.loads(line) for line in Path(config['sample_manifest']).read_text().splitlines() if line.strip()]
@@ -465,10 +464,6 @@ def main():
     (out / 'samples.jsonl').write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in samples), encoding='utf-8')
     atomic_json(out / 'sample_info.json', {'selected_images': len(samples), 'validation_images': len(rows),
         'sample_seed': config['sample_seed'], 'method': 'frozen_manifest' if config['sample_manifest'] else 'uniform_random_without_replacement'})
-    if config['mode'] == 'prepare':
-        atomic_json(out / 'summary.json', {'status': 'prepared_only', 'images': len(samples), 'inference_performed': False})
-        print('Prepared samples/config; no model loaded:', out)
-        return
     if config['mode'] == 'profile':
         result = launch(config, samples, [config['gpu']], config['profiler']['batch_size'], out / 'profile', profiling=True)
         atomic_json(out / 'summary.json', result)

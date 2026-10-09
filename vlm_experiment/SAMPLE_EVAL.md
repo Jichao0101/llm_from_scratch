@@ -14,13 +14,7 @@ python src/s02_sample_eval.py --config sample_eval.json
 
 修改`batch_sizes`控制扫描档位，必须递增且从1开始。按`sample_seed`随机无放回抽样，不按状态、场景、会话或尺寸分层；各配置使用同一清单。实际输入token和padding宽度随输出保存。
 
-仅生成样本与运行配置、不加载模型时，在JSON中设置`"mode": "prepare"`及新的`out`目录：
-
-```bash
-python src/s02_sample_eval.py --config sample_eval.json
-```
-
-每次运行都要求新的`out`目录，不覆盖旧结果。prepare、benchmark和profile使用不同输出目录。示例JSON的`sample_manifest`为null，按固定种子选样；需要严格复用某次清单时，将其设为该次输出的`samples.jsonl`。脚本仅核对sample ID与图片路径和当前val manifest一致，不比较GT或其他元数据，不重新扫描源文件hash。
+每次运行都要求新的`out`目录，不覆盖旧结果。benchmark和profile均自动选样并保存清单，使用不同输出目录，无需预先准备样本。示例JSON的`sample_manifest`为null，按固定种子选样；需要严格复用某次清单时，将其设为该次输出的`samples.jsonl`。脚本仅核对sample ID与图片路径和当前val manifest一致，不比较GT或其他元数据，不重新扫描源文件hash。
 
 ## DP开关
 
