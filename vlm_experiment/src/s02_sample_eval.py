@@ -1,7 +1,7 @@
 """用固定验证样本扫描batch、独立profile及单卡/多卡分片吞吐；不替代正式baseline。"""
 import argparse
 from collections import Counter
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import json
 import multiprocessing as mp
 import os
@@ -84,10 +84,12 @@ def read_config(path):
         raise ValueError('max_new_tokens must be smaller than context_budget')
     if not config['gpu'] or ',' in config['gpu']:
         raise ValueError('gpu must identify exactly one GPU')
+    sizes = config['batch_sizes']
+    if not sizes or sizes[0] != 1 or min(sizes) < 1 or sizes != sorted(set(sizes)):
+        raise ValueError('Increasing unique batch_sizes starting at 1 required')
     if mode == 'benchmark':
-        sizes = config['batch_sizes']
-        if not sizes or sizes[0] != 1 or min(sizes) < 1 or sizes != sorted(set(sizes)) or config['repeats'] < 1:
-            raise ValueError('Positive repeats and increasing unique batch_sizes starting at 1 required')
+        if config['repeats'] < 1:
+            raise ValueError('Positive repeats required')
         dp = config['dp']
         if type(dp['enabled']) is not bool:
             raise ValueError('dp.enabled must be boolean')
@@ -96,8 +98,8 @@ def read_config(path):
             if (len(gpus) < 2 or len(set(gpus)) != len(gpus) or
                     any(not g or ',' in g for g in gpus) or gpus[0] != config['gpu'] or dp['batch_size'] not in sizes):
                 raise ValueError('DP requires unique GPUs, first GPU equal to gpu, and batch_size in batch_sizes')
-    if mode == 'profile' and min(config['profiler'][k] for k in ('batch_size', 'batches')) < 1:
-        raise ValueError('Profiler batch_size and batches must be positive')
+    if mode == 'profile' and config['profiler']['batches'] < 1:
+        raise ValueError('Profiler batches must be positive')
     for key in ('dataset', 'out', 'model', 'sample_manifest'):
         if key == 'sample_manifest' and config[key] is None:
             continue
@@ -129,28 +131,60 @@ def generated_tokens(tokens, eos_ids, pad_id):
     return tokens, False
 
 
+@contextmanager
+def profile_stage(name, torch, measurements):
+    """同步划定阶段边界；峰值是进程allocator显存，包含模型及前阶段存活张量。
+
+    只在profile模式重置峰值，不改变benchmark整轮峰值。reserved增量反映
+    allocator扩容，不能当作activation；算子内存净增量也不能替代阶段峰值。
+    """
+    torch.cuda.synchronize()
+    before = memory_stats(torch)
+    torch.cuda.reset_peak_memory_stats()
+    started = time.perf_counter()
+    try:
+        with torch.profiler.record_function('pipeline/' + name):
+            yield
+    finally:
+        torch.cuda.synchronize()
+        after = memory_stats(torch)
+        measurements[name] = {
+            'elapsed_us': (time.perf_counter() - started) * 1e6,
+            'allocated_before_bytes': before['allocated_bytes'],
+            'allocated_after_bytes': after['allocated_bytes'],
+            'reserved_before_bytes': before['reserved_bytes'],
+            'reserved_after_bytes': after['reserved_bytes'],
+            'peak_allocated_bytes': after['peak_allocated_bytes'],
+            'peak_reserved_bytes': after['peak_reserved_bytes'],
+            'peak_allocated_increase_bytes': max(0, after['peak_allocated_bytes'] - before['allocated_bytes']),
+            'peak_reserved_increase_bytes': max(0, after['peak_reserved_bytes'] - before['reserved_bytes']),
+        }
+
+
 def infer_batch(rows, model, processor, prompt, config, torch, profiling=False):
     """一次真实batch generate；计时含读图、处理、传输、生成、输出解码，不含写盘。"""
     cases = {r['sample_id']: {'sample_id': r['sample_id'], 'image': r['image'],
                              'raw_output': None, 'status': 'failed'} for r in rows}
-    stages, images = {}, []
+    stages, images, stage_memory = {}, [], {}
     inputs = outputs = None
     stage = 'image'
     torch.cuda.synchronize()
     started = time.perf_counter()
-    mark = torch.profiler.record_function if profiling else lambda name: nullcontext()
+    mark = lambda name: profile_stage(name, torch, stage_memory) if profiling else nullcontext()
     try:
         tick = time.perf_counter()
-        with mark('pipeline/read_images'):
+        with mark('read_images'):
             for row in rows:
                 with Image.open(row['image']) as source:
                     images.append(source.convert('RGB'))
         stages['read_images_us'] = (time.perf_counter() - tick) * 1e6
         batch = {'requested_images': len(rows), 'generated_images': 0, 'stage_us': stages}
+        if profiling:
+            batch['stage_memory'] = stage_memory
 
         stage = 'processor'
         tick = time.perf_counter()
-        with mark('pipeline/processor'):
+        with mark('processor'):
             inputs = processor(text=[prompt] * len(images), images=images, return_tensors='pt',
                                padding=True, truncation=False)
             width = inputs['input_ids'].shape[-1]
@@ -166,13 +200,13 @@ def infer_batch(rows, model, processor, prompt, config, torch, profiling=False):
 
         stage = 'transfer'
         tick = time.perf_counter()
-        with mark('pipeline/host_to_device'):
+        with mark('host_to_device'):
             inputs = inputs.to('cuda:0')
             torch.cuda.synchronize()
         stages['host_to_device_us'] = (time.perf_counter() - tick) * 1e6
         stage = 'generate'
         tick = time.perf_counter()
-        with mark('pipeline/generate'), torch.inference_mode():
+        with mark('generate'), torch.inference_mode():
             outputs = model.generate(**inputs, max_new_tokens=config['max_new_tokens'], do_sample=False,
                                      num_beams=1, use_cache=True, return_dict_in_generate=False,
                                      pad_token_id=processor.tokenizer.pad_token_id)
@@ -183,7 +217,7 @@ def infer_batch(rows, model, processor, prompt, config, torch, profiling=False):
         batch['generated_images'] = len(rows)
         stage = 'decode'
         tick = time.perf_counter()
-        with mark('pipeline/decode_outputs'):
+        with mark('decode_outputs'):
             # 所有输出按补齐后的输入宽度截取，不能用各sample的未padding长度。
             tails = outputs[:, width:].cpu().tolist()
             eos = model.generation_config.eos_token_id
@@ -210,7 +244,7 @@ def infer_batch(rows, model, processor, prompt, config, torch, profiling=False):
             if cases[row['sample_id']]['status'] != 'generated':
                 cases[row['sample_id']].update(error_type=stage, error='{}: {}'.format(type(exc).__name__, exc))
         exc.batch_cases = cases
-        exc.batch_measurement = {'failed_stage': stage, 'stage_us': stages,
+        exc.batch_measurement = {'failed_stage': stage, 'stage_us': stages, 'stage_memory': stage_memory,
                                  'elapsed_until_failure_us': (time.perf_counter() - started) * 1e6}
         raise
     finally:
@@ -281,14 +315,17 @@ def worker(config, rows, gpu, batch_size, rank, output, barrier, profiling):
         if profiling:
             settings = config['profiler']
             profiled_rows = rows[:batch_size * settings['batches']]
+            measurements = []
+            result['profile_batches'] = measurements  # 故障时保留此前完成批次及失败阶段。
             with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                    torch.profiler.ProfilerActivity.CUDA],
                                         record_shapes=settings['record_shapes'], profile_memory=settings['profile_memory'],
                                         with_stack=settings['with_stack']) as profile:
                 for start in range(0, len(profiled_rows), batch_size):
-                    cases, _ = infer_batch(profiled_rows[start:start + batch_size], model, processor,
+                    cases, measurement = infer_batch(profiled_rows[start:start + batch_size], model, processor,
                                            prompt, config, torch, profiling=True)
                     current_cases.update(cases)
+                    measurements.append(measurement)
                     profile.step()
             profile.export_chrome_trace(str(output / 'trace.json'))
             operators = []
@@ -303,8 +340,24 @@ def worker(config, rows, gpu, batch_size, rank, output, barrier, profiling):
                 })
             atomic_json(output / 'operators.json', sorted(operators, key=lambda op: op['self_device_us'], reverse=True))
             write_cases(output / 'profile_outputs.jsonl', current_cases)
+            # 按阶段汇总每批边界测量；尾批不混入完整batch的档位比较。
+            full_batches = [m for m in measurements if m['requested_images'] == batch_size]
+            result['full_profile_batches'] = len(full_batches)
+            result['stage_summary'] = {
+                name: {
+                    'mean_elapsed_us': statistics.mean(m['stage_memory'][name]['elapsed_us'] for m in full_batches),
+                    'max_peak_allocated_bytes': max(m['stage_memory'][name]['peak_allocated_bytes'] for m in full_batches),
+                    'max_peak_reserved_bytes': max(m['stage_memory'][name]['peak_reserved_bytes'] for m in full_batches),
+                    'max_peak_allocated_increase_bytes': max(m['stage_memory'][name]['peak_allocated_increase_bytes'] for m in full_batches),
+                    'max_peak_reserved_increase_bytes': max(m['stage_memory'][name]['peak_reserved_increase_bytes'] for m in full_batches),
+                } for name in full_batches[0]['stage_memory']
+            }
+            # 总窗口峰值包含尾批；尾批可能因图像/token更长而占用更多显存。
+            result['profile_peak_allocated_bytes'] = max(v['peak_allocated_bytes'] for m in measurements for v in m['stage_memory'].values())
+            result['profile_peak_reserved_bytes'] = max(v['peak_reserved_bytes'] for m in measurements for v in m['stage_memory'].values())
+            result['allocated_headroom_bytes'] = result['runtime']['gpu_total_bytes'] - result['profile_peak_allocated_bytes']
             result.update(status='profile_complete', inference=summarize_inference(profiled_rows, current_cases),
-                          profiled_images=len(profiled_rows), note='Profiler timing is diagnostic, not steady throughput.')
+                          profiled_images=len(profiled_rows), note='Profiler timing and memory are diagnostic; shape/stack tracing can perturb execution and tensor lifetimes. Compare capacity with unprofiled benchmark peaks.')
         else:
             for repeat in range(config['repeats']):
                 current_cases, measurements = {}, []
@@ -458,6 +511,8 @@ def main():
         samples = frozen
     else:
         samples = select_samples(rows, config['sample_count'], config['sample_seed'])
+    if config['mode'] == 'profile' and len(samples) < max(config['batch_sizes']):
+        raise ValueError('Profile needs at least max(batch_sizes) samples; increase sample_count')
     out = Path(config['out'])
     out.mkdir(parents=True, exist_ok=False)  # 不覆盖已存在结果；每轮使用新输出目录。
     atomic_json(out / 'config.json', {**config, 'prompt_template': PROMPT_TEMPLATE, 'coordinate_scale': 'norm1000'})
@@ -465,11 +520,30 @@ def main():
     atomic_json(out / 'sample_info.json', {'selected_images': len(samples), 'validation_images': len(rows),
         'sample_seed': config['sample_seed'], 'method': 'frozen_manifest' if config['sample_manifest'] else 'uniform_random_without_replacement'})
     if config['mode'] == 'profile':
-        result = launch(config, samples, [config['gpu']], config['profiler']['batch_size'], out / 'profile', profiling=True)
-        atomic_json(out / 'summary.json', result)
-        if result['status'] != 'profile_complete':
-            raise RuntimeError('Profile failed; see rank result and partial outputs')
-        print('Profiler trace and operator summary:', out / 'profile' / 'rank0')
+        # 相同batch档位/样本前缀与benchmark对齐；至少一整批才能证明该档真实容量。
+        report = {'status': 'running', 'single_gpu': [], 'formal_baseline': False,
+                  'selection_note': 'Inference profile only; training needs backward/optimizer measurements. '
+                                    'Profiler latency includes instrumentation overhead. Allocator headroom excludes other processes and non-PyTorch allocations.'}
+        atomic_json(out / 'summary.json', report)
+        try:
+            for batch_size in config['batch_sizes']:
+                result = launch(config, samples, [config['gpu']], batch_size,
+                                out / ('profile_b{}'.format(batch_size)), profiling=True)
+                report['single_gpu'].append(result)
+                atomic_json(out / 'summary.json', report)
+                if result['status'] != 'profile_complete':
+                    report.update(status='stopped', reason='OOM/runtime failure; larger batches not attempted')
+                    break
+            else:
+                report['status'] = 'complete'
+        except Exception as exc:
+            report.update(status='failed', error='{}: {}'.format(type(exc).__name__, exc))
+            raise
+        finally:
+            atomic_json(out / 'summary.json', report)
+        if report['status'] != 'complete':
+            raise RuntimeError('Profile scan failed; see summary.json and rank results')
+        print('Batch profile comparison:', out / 'summary.json')
         return
 
     report = {'status': 'running', 'single_gpu': [], 'dp': None, 'formal_baseline': False}

@@ -32,7 +32,6 @@
     "batch_size": 8
   },
   "profiler": {
-    "batch_size": 8,
     "batches": 3,
     "record_shapes": true,
     "profile_memory": true,

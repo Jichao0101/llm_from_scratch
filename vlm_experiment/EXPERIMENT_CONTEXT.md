@@ -71,3 +71,5 @@
 2026-10-08实现精简：样本效率脚本不重复校验GT坐标/舍入合同或图片尺寸；JSON只保留必填项和当前模式的关键关系校验。复用清单仅核对sample ID与图片路径。坏图、超预算直接终止配置，不过滤样本继续测量；保留CUDA同步、OOM停止和DP无重复/遗漏检查。运行归档保留配置、样本、核心环境与结果，不再复制源码或查询Git。
 
 用户后续约定：效率脚本仅保留benchmark和profile两种模式，两者自动选样并保存清单；复用样本通过sample_manifest指定已有samples.jsonl，无独立样本准备模式。
+
+2026-10-10实现更新：profile与benchmark共用JSON的batch_sizes（移除profiler.batch_size）；单卡逐档预热后采集读图、processor、H2D、generate、decode的耗时和allocated/reserved阶段峰值及入口增量，输出profile_b*/rank0的trace/算子统计、profile_batches和仅完整批stage_summary。普通benchmark保留整轮峰值和稳定吞吐。推理profile不能证明训练容量，微调候选仍需实测backward/optimizer step。本地结构验证不代表云端GPU实测。
