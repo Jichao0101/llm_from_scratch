@@ -13,11 +13,13 @@ python src/s02_sample_eval.py --config sample_eval.json
 | mode | 用途 | 固定测量范围 |
 |---|---|---|
 | benchmark | 比较完整固定样本的稳定性能，多轮重复 | 整轮、每批、读图/processor/H2D/generate/输出解码的基础耗时、吞吐和整轮显存峰值 |
-| timing | 解释generate内部耗时，短窗口 | 视觉编码、语言prefill、语言decode及输出投影；CPU计时和CUDA事件 |
-| memory | 解释显存增长，短窗口 | 先测五环节allocator峰值，再独立测生成内部模块峰值，避免嵌套重置 |
+| timing | 流程级区间计时，短窗口 | 读图、processor、H2D、generate、输出解码；CPU计时和CUDA事件，不安装生成hook |
+| memory | 流程级显存统计，短窗口 | 五环节allocator入口、结束和峰值；不安装生成hook，不额外重复模块推理 |
 | operator | 发现瓶颈后进行算子归因，短窗口 | 五环节及生成内部的region标记、CPU/CUDA算子统计和trace |
 
-先benchmark，再按需要分别运行timing、memory，仍需算子归因时才运行operator。三种诊断不会互相自动开启，timing/memory不启动torch.profiler。pipeline/generation是结果分组名称，不再是配置选项，测量位置固定在代码。
+先benchmark，再按需要分别运行timing、memory，仍需算子归因时才运行operator。三种诊断不会互相自动开启，timing/memory不启动torch.profiler，也不安装生成内部hook。pipeline/generation是结果分组名称，不再是配置选项，测量位置固定在代码。
+
+共享加载、冷调用和预热完成后，worker按mode一次分发到run_benchmark/run_timing/run_memory/run_operator；进程启动和推理接口不再传递额外profiling布尔标志。根入口共用一次batch扫描，DP仅由benchmark追加执行。
 
 ## 配置示例与条件参数
 
@@ -82,13 +84,13 @@ benchmark保留每轮global_pipeline_us、逐批pipeline_us及stage_us，另汇�
 
 诊断取同一清单的前`batch_size × capture_batches`张，保留尾批；至少需要max(batch_sizes)张。完整批用于stage_summary，实际生成数和总窗口峰值仍包括尾批。
 
-- timing：generation_timing、generation_profile.json保存内部逐调用事件；stage_summary汇总完整批中各模块调用的平均CPU/CUDA耗时及次数。CPU提交时间与当前stream CUDA事件区间不同，事件区间可能包含调度空隙，不等于纯kernel计算时间。
-- memory：stage_memory保存五环节allocated/reserved入口、结束、峰值及增量，stage_summary仅汇总完整批峰值；generation_memory及generation_profile.json来自第二次独立模块测量，保存两次输出差异数和token数。同步后的诊断时长不用于稳定吞吐。
+- timing：pipeline_timing保存流程区间调用记录，每批stage_timing及stage_summary汇总完整批的CPU/CUDA耗时；不再输出生成内部计时文件。CPU提交时间与当前stream CUDA事件区间不同，事件区间可能包含调度空隙，不等于纯kernel计算时间。
+- memory：pipeline_memory保留完整流程区间记录，每批stage_memory保存五环节allocated/reserved入口、结束、峰值及增量，stage_summary仅汇总完整批峰值。不进行第二次生成模块测量，不输出generation_memory或generation_profile.json；同步后的诊断时长不用于稳定吞吐。
 - operator：profile_b*/rank0/trace.json与operators.json保存区间标记和CPU/CUDA算子调用数、total/self耗时与内存净变化；stage_summary为空，不额外运行Timing或Memory窗口。包含关系下的region/aten/kernel时间不可相加。
 
 加载后allocator快照与通用执行墙钟字段仍会保留，不能据此认为开启了阶段显存或CUDA事件采集。阶段峰值/headroom仅在memory诊断输出；峰值增量不全部归为activation，reserved不等于活跃tensor，各阶段峰值不可相加。headroom仅是总容量减PyTorch峰值，不覆盖其他进程和非PyTorch分配。
 
-Qwen生成hook依据语言forward输入长度和进入前的缓存长度识别prefill/decode；接口不匹配时显式失败。视觉、语言主干和输出投影区间不覆盖generate的全部控制、embedding和采样开销。
+仅operator模式安装Qwen生成hook，依据语言forward输入长度和进入前的缓存长度识别prefill/decode；接口不匹配时显式失败。视觉、语言主干和输出投影区间不覆盖generate的全部控制、embedding和采样开销。
 
 OOM记录该配置不可行并停止更大档位；坏图、预算超限和其他运行故障亦终止该轮，不缩小batch伪装成功。每轮比较冻结模型、prompt、processor预算和生成条件；输出长度变化与工具开销均需单独解释。随机小样本不证明最大输入容量或正式精度。
 

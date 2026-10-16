@@ -98,8 +98,12 @@ benchmark不是只执行：每轮总耗时、每批耗时、五环节耗时、�
 
 ## 当前配置合同（2026-10-16收敛）
 
-当前代码使用四种mode：benchmark/timing/memory/operator；取消用户可选的pipeline/generation粒度。benchmark固定基础pipeline计时与吞吐，timing固定生成内部计时，memory固定流程及独立生成模块峰值，operator固定流程/模块region和算子trace。三类诊断互相独立。
+当前代码使用四种mode：benchmark/timing/memory/operator；取消用户可选的pipeline/generation粒度。benchmark固定基础pipeline计时与吞吐，timing仅固定五环节CPU/CUDA计时，memory仅固定五环节allocator统计，operator固定流程/模块region和算子trace。三类诊断互相独立。
 
 GPU统一为gpus列表，多卡仅benchmark支持，dp_batch_size指定每卡batch并要求单卡扫描有同档参考。随机抽样才要求sample_count/sample_seed，sample_manifest路径复用清单时移除这两个无效字段；诊断必填capture_batches，benchmark必填repeats。生成seed=42、算子record_shapes/profile_memory开启及with_stack关闭固定在代码，并归档实际设置。旧gpu/dp/seed/profiler配置明确拒绝，不兼容静默回退。此前日期段落描述旧接口，当前使用说明以本节及SAMPLE_EVAL.md为准。
 
 本轮是配置及调用点收敛、本地结构与模拟验证；无新增云端测量，不修改README或原实验方案。
+
+## 当前执行边界：单次四路分发
+
+用户确认生成内部hook仅operator需要。worker在共享加载/冷调用/预热后，通过mode一次分发到四个运行函数；launch/worker/infer_batch不再传递profiling布尔标志。主入口共用batch扫描，benchmark按需追加DP。timing和memory只测五个流程区间，memory不再额外进行第二次模块级测量。generation_operator_regions只负责Qwen生成边界和OperatorProfiler的region标记，不再认识Timing/Memory采集器。JSON配置及算子全batch扫描配置不变，旧结果不覆盖。
