@@ -1,62 +1,101 @@
-# 固定样本 batch / DP 实验
+# 固定样本batch与DP性能实验
 
-入口为 `src/s02_sample_eval.py`，实验配置为 `sample_eval.json`。`--config`必须显式指定，所有参数直接读取JSON；保留必填项与当前模式的关键参数检查，未启用的DP/profiler参数不校验，脚本不内置默认参数，不合并默认配置，也不从CLI覆盖mode。独立读取构建好的验证manifest；不重复检查GT坐标或量化合同，内部维护固定Norm1000 prompt与输出解码；不需要原始data-root，也不校验图片、模型或清单hash。
-
-## 云端运行
-
-只需传输`src/s02_sample_eval.py`和JSON配置文件即可运行本环节，无下一阶段脚本依赖。在配置中填写实际`dataset`、`model`和新的`out`目录；相对路径基于配置文件所在目录，不基于当前工作目录。`dataset`指包含`dataset.json`和`val.jsonl`的构建结果目录。
+入口为`src/s02_sample_eval.py`，配置为`sample_eval.json`；云端需同时传输`src/experiment_profiler.py`。所有可变实验参数显式读取JSON，不合并默认配置。相对路径基于JSON所在目录，`dataset`指包含dataset.json与val.jsonl的构建结果；不接收原始data-root，不重新校验源文件hash。
 
 ```bash
 python src/s02_sample_eval.py --config sample_eval.json
 ```
 
-示例JSON填写`mode=benchmark`，单卡GPU 0，固定最多128张验证样本，扫描B=1/2/4/8/16/32，每档首次调用、2批预热后完整样本重复3轮。每档重新加载模型，加载和冷调用单列，稳定吞吐不含加载。本环节只测模型推理效率，不读取GT评分，也不要求生成内容正确；模型精度留到正式baseline评估。
+本环节只比较推理效率，不读取GT评分、不要求场景覆盖，不替代正式baseline。每次使用新的`out`目录，保留配置、样本、执行结果和失败信息；已有run不覆盖。
 
-修改`batch_sizes`控制扫描档位，必须递增且从1开始。按`sample_seed`随机无放回抽样，不按状态、场景、会话或尺寸分层；各配置使用同一清单。实际输入token和padding宽度随输出保存。
+## 四种模式与固定测量位置
 
-每次运行都要求新的`out`目录，不覆盖旧结果。benchmark和profile均自动选样并保存清单，使用不同输出目录，无需预先准备样本。示例JSON的`sample_manifest`为null，按固定种子选样；需要严格复用某次清单时，将其设为该次输出的`samples.jsonl`。脚本仅核对sample ID与图片路径和当前val manifest一致，不比较GT或其他元数据，不重新扫描源文件hash。
+| mode | 用途 | 固定测量范围 |
+|---|---|---|
+| benchmark | 比较完整固定样本的稳定性能，多轮重复 | 整轮、每批、读图/processor/H2D/generate/输出解码的基础耗时、吞吐和整轮显存峰值 |
+| timing | 解释generate内部耗时，短窗口 | 视觉编码、语言prefill、语言decode及输出投影；CPU计时和CUDA事件 |
+| memory | 解释显存增长，短窗口 | 先测五环节allocator峰值，再独立测生成内部模块峰值，避免嵌套重置 |
+| operator | 发现瓶颈后进行算子归因，短窗口 | 五环节及生成内部的region标记、CPU/CUDA算子统计和trace |
 
-## DP开关
+先benchmark，再按需要分别运行timing、memory，仍需算子归因时才运行operator。三种诊断不会互相自动开启，timing/memory不启动torch.profiler。pipeline/generation是结果分组名称，不再是配置选项，测量位置固定在代码。
 
-先查看单卡吞吐与显存余量，再在配置中设置：
+## 配置示例与条件参数
+
+单卡benchmark示例：
 
 ```json
-"dp": {
-  "enabled": true,
-  "gpus": ["0", "1", "2", "3"],
-  "batch_size": 8
+{
+  "dataset": "extract_data",
+  "out": "runs/sample_eval_benchmark_v1",
+  "model": "/workspace/dms-eye-status-turbo/qwen_models/Qwen3.5-9B",
+  "mode": "benchmark",
+  "sample_manifest": null,
+  "sample_count": 128,
+  "sample_seed": 20261008,
+  "batch_sizes": [1, 2, 4, 8, 16, 32],
+  "gpus": ["0"],
+  "warmup_batches": 2,
+  "repeats": 3,
+  "context_budget": 5600,
+  "max_new_tokens": 256,
+  "cpu_threads_per_worker": 4
 }
 ```
 
-GPU标识为CUDA可见设备ID或UUID字符串；开启时第一张卡须与`gpu`一致，`dp.batch_size`必须在单卡扫描列表中。batch size为**每卡**大小，例如4卡×8为每轮最多32张；不足整批正常处理。报告保存实际最大批大小；样本数少于配置档位时，不能据此宣称该档位的完整容量已经验证。先按配置完成单卡扫描，再运行多卡，不自动根据旧显存数据选最大batch。若此前扫描有OOM、输入错误，先处理问题或缩小`batch_sizes`，不会继续DP。
+| 参数 | 生效条件 |
+|---|---|
+| dataset/model/out、mode、gpus、batch_sizes、warmup_batches、context_budget、max_new_tokens、cpu_threads_per_worker | 所有模式必填 |
+| sample_manifest | 所有模式必填；null表示按种子随机采样，路径表示复用冻结清单 |
+| sample_count、sample_seed | 仅随机抽样时必填；复用清单时移除并且不要求填写 |
+| repeats | 仅benchmark必填，控制完整样本重复次数 |
+| capture_batches | timing/memory/operator必填，控制每个batch档位的短窗口批数 |
+| dp_batch_size | 仅多GPU benchmark必填，表示DP每卡batch，必须属于batch_sizes |
 
-DP每卡独立进程、一份完整模型，按sample分片；无训练梯度同步。各轮预热后对齐开始，按最早开始到最晚完成的全局窗口计算吞吐；不将各卡局部吞吐简单相加。合并时检查重复/遗漏sample ID。任一worker故障中止同组其他worker，保留日志和部分输出，不静默切回单卡或小batch。GPU选择是配置，不代表当前空闲；实际运行前查看云端资源。
+`batch_sizes`为递增、唯一的正整数，可以只测[16,32]；无B1时不计算speedup_vs_b1。每档重新加载模型，冷调用与预热不混入稳定窗口。超输入预算直接终止该配置，不截断、降分辨率或过滤样本。
 
-## 独立profiler
+复用样本时将`sample_manifest`设为既有run的samples.jsonl，可以完全省略sample_count/sample_seed；脚本只核对sample ID和图片绝对路径与当前验证manifest一致。随机抽样为均匀无放回、最多sample_count张，不按场景/状态分层。输出sample_info仅在实际随机抽样时记录抽样seed。
 
-在JSON中设置`"mode": "profile"`，将`out`设为新的profile目录，两种模式共用`batch_sizes`逐档扫描；示例JSON每档最多记录3批，使用`gpu`指定的单卡。`dp`配置不参与profile模式。
+诊断运行将mode改为timing、memory或operator，增加`capture_batches`并设置新out，例如捕获3批；operator可先缩到1批并只测瓶颈batch。诊断模式不要求repeats，也不使用DP配置。
 
-```bash
-python src/s02_sample_eval.py --config sample_eval.json
+代码固定生成seed=42；operator固定record_shapes=true、profile_memory=true、with_stack=false。前者保存在输出config.json的generation_seed，后者仅operator运行保存在operator_settings；它们是已明确的实现常量，不是默认配置合并。
+
+旧版的gpu、dp、seed、profiler字段会被拒绝，请迁移为gpus、dp_batch_size、四种mode及capture_batches；不保留旧profiler.measurement/detail开关。
+
+## GPU与DP
+
+`gpus`使用GPU ID或UUID字符串。单元素表示单卡；多个元素仅允许benchmark，先在第一张卡完成batch扫描，再在全部指定卡上以dp_batch_size比较独立副本分片推理。例如：
+
+```json
+"gpus": ["0", "1", "2", "3"],
+"dp_batch_size": 16
 ```
 
-每档输出`profile_b*/rank0/trace.json`和`operators.json`，包含读图、processor、传输、generate、输出解码的阶段标记以及CPU/CUDA算子耗时和内存。可用Perfetto等trace查看器分析实际prefill/decode、视觉编码和kernel路径；不根据扩展包安装情况推断kernel已执行。profiler含工具开销，仅用于归因，不与benchmark稳定吞吐直接比较。`record_shapes=true`还可能暂时保留张量引用并引入额外拷贝，影响显存；容量结论应同时参考benchmark无profiler的整轮峰值，必要时关闭shape/stack追踪复测。
+timing、memory、operator明确要求单元素gpus，不静默忽略其他卡。每个worker只可见所选的一张卡，进程内设备为cuda:0；配置不证明该卡当前空闲，运行前检查云端资源。
 
-每档首次调用、预热后测量相同样本清单的前`batch_size × profiler.batches`张；样本不足时使用实际批数及尾批。至少需要`max(batch_sizes)`张样本，否则拒绝profile。`profile_batches`记录每批的阶段耗时及`stage_memory`；`stage_summary`只汇总完整批，保存各阶段平均耗时、最大allocated/reserved峰值及相对阶段入口的峰值增量。图像读取、processor、H2D、generate、decode分别同步测量；峰值在每阶段入口重置，故障时也保留失败阶段测量。benchmark不做阶段峰值重置，仍保留整轮峰值。
+DP每卡独立进程、一份完整模型，样本分片不重复；不使用训练DDP同步。各轮预热后对齐，按最早开始至最晚完成的全局窗口计算吞吐，不相加局部吞吐。与相同每卡batch的单卡结果计算加速比和效率；样本不足以填满实际batch时不声称容量已验证。任一worker失败中止同组其他worker，保存原始故障和部分输出，不静默回退单卡或小batch。
 
-阶段显存包含模型、存活输入/输出及缓存，峰值增量不是独立activation大小；reserved表示allocator缓存/扩容，不是实际活跃张量。`allocated_headroom_bytes`仅是卡总容量减去PyTorch allocated峰值，不包含其他进程或非PyTorch分配，不能当作真实可用显存。算子内存统计是净变化，阶段allocator峰值才用于容量判断。`profile_memory`控制算子内存追踪，关闭后阶段显存仍会采集。
+## 输出与计时口径
 
-先用benchmark比较真实吞吐及波动，再用同档profile定位耗时/显存增长来源；不以最大batch或profiler吞吐自动推荐最优值。这是推理实验，只能为微调筛选候选micro-batch；SFT/LoRA需要另测forward、backward、optimizer step，并固定序列长度、更新范围、checkpointing、优化器等训练条件。
+所有模式保存config.json、samples.jsonl、sample_info.json、summary.json。结果记录实际输入/输出token、失败与生成上限命中情况；不因模型内容错误停止效率扫描。
 
-## 结果与停止条件
+benchmark保留每轮global_pipeline_us、逐批pipeline_us及stage_us，另汇总mean_global_pipeline_us、stdev_global_pipeline_us、mean_batch_pipeline_us、mean_stage_us_per_batch和吞吐波动。基础计时始终启用，不需要timing模式；单位微秒，用perf_counter与必要CUDA同步。模型加载、预热、barrier等待、写盘和日志在稳定窗口之外。批均值包含尾批，DP批/环节均值跨rank池化，不代表全局批延迟；单批耗时除以图片数只能称摊销耗时。
 
-- 根目录：`config.json`、`samples.jsonl`、`sample_info.json`、`summary.json`；不复制源码或查询Git状态。
-- 每档：`single_b*/result.json`、逐轮`outputs_r*.jsonl`。`rank0/result.json`包含核心运行环境、processor配置、冷调用、分阶段耗时、输入/输出token、逐批延迟和显存。
-- DP：`dp/result.json`及各rank结果，根`summary.json`另报告对相同每卡batch单卡结果的吞吐加速比和并行效率。
-- Profile：短窗口trace、原始算子聚合及profile样本输出，不宣称全样本稳定测量。
+诊断取同一清单的前`batch_size × capture_batches`张，保留尾批；至少需要max(batch_sizes)张。完整批用于stage_summary，实际生成数和总窗口峰值仍包括尾批。
 
-稳定窗口含读图/processor/H2D/generate/输出解码，GPU计时显式同步；写盘、日志、模型加载、预热、等待barrier及profiler不计入。耗时统一为微秒；`generated_images_per_s`统计实际完成生成的图片，`attempted_images_per_s`包含尝试处理的图片，图片读取或预算超限直接终止当前配置，不筛除样本、不缩小batch，也不发布该配置的完整吞吐成绩。`generate_only_*_per_gpu_pooled`仅为生成阶段每GPU汇总参考，不能当作多卡端到端吞吐。batch耗时是批延迟，不是单请求延迟。
+- timing：generation_timing、generation_profile.json保存内部逐调用事件；stage_summary汇总完整批中各模块调用的平均CPU/CUDA耗时及次数。CPU提交时间与当前stream CUDA事件区间不同，事件区间可能包含调度空隙，不等于纯kernel计算时间。
+- memory：stage_memory保存五环节allocated/reserved入口、结束、峰值及增量，stage_summary仅汇总完整批峰值；generation_memory及generation_profile.json来自第二次独立模块测量，保存两次输出差异数和token数。同步后的诊断时长不用于稳定吞吐。
+- operator：profile_b*/rank0/trace.json与operators.json保存区间标记和CPU/CUDA算子调用数、total/self耗时与内存净变化；stage_summary为空，不额外运行Timing或Memory窗口。包含关系下的region/aten/kernel时间不可相加。
 
-OOM保留该档失败并停止更大档位；图片读取、预算或运行失败也阻止后续比较。生成内容不正确不会中止扫描。结合吞吐波动、显存余量和trace选择执行配置；记录实际输出token数和生成上限命中情况，避免把输出长度变化直接解释成加速。随机小样本结果仅代表本轮工作负载，不声明场景覆盖或最大输入容量。
+加载后allocator快照与通用执行墙钟字段仍会保留，不能据此认为开启了阶段显存或CUDA事件采集。阶段峰值/headroom仅在memory诊断输出；峰值增量不全部归为activation，reserved不等于活跃tensor，各阶段峰值不可相加。headroom仅是总容量减PyTorch峰值，不覆盖其他进程和非PyTorch分配。
 
-接口核对：[Transformers Qwen3.5](https://huggingface.co/docs/transformers/model_doc/qwen3_5)、[PyTorch Profiler](https://docs.pytorch.org/docs/stable/profiler)。具体运行使用云端固定依赖版本，不自动升级。
+Qwen生成hook依据语言forward输入长度和进入前的缓存长度识别prefill/decode；接口不匹配时显式失败。视觉、语言主干和输出投影区间不覆盖generate的全部控制、embedding和采样开销。
+
+OOM记录该配置不可行并停止更大档位；坏图、预算超限和其他运行故障亦终止该轮，不缩小batch伪装成功。每轮比较冻结模型、prompt、processor预算和生成条件；输出长度变化与工具开销均需单独解释。随机小样本不证明最大输入容量或正式精度。
+
+## 后续LoRA复用
+
+通用模块仍提供三个独立工具：TimingProfiler.measure/resolve/report、MemoryProfiler.measure/report、OperatorProfiler.capture/region/step/export。生成hook及阶段语义由推理脚本负责，模块不加载模型、读取数据或执行训练/参数搜索。
+
+训练循环可用measure标记forward、backward、optimizer step和zero_grad；Timing事件须显式resolve后report，Timing不读取allocator；Memory同步测峰值，禁止同设备嵌套，包括不同实例。Operator以capture管理短窗口，region可嵌套，区间结束后才step，窗口退出后export。metadata仅允许标量，不保留tensor延长生命周期。
+
+真实训练需明确梯度累积、有效监督tokens、首次及稳定完整更新，计时、峰值及算子窗口分别运行；最优微调配置仍需独立质量对照。本仓库尚未因此实现LoRA训练循环或参数搜索。

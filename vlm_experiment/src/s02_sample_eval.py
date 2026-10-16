@@ -1,7 +1,7 @@
 """用固定验证样本扫描batch、独立profile及单卡/多卡分片吞吐；不替代正式baseline。"""
 import argparse
 from collections import Counter
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import json
 import multiprocessing as mp
 import os
@@ -12,6 +12,7 @@ import sys
 import time
 import traceback
 
+from experiment_profiler import MemoryProfiler, OperatorProfiler, TimingProfiler, memory_stats
 from PIL import Image
 PROMPT_TEMPLATE = '''Locate the driver's two eyes in this image.
 image_left_eye is the eye with the smaller horizontal box-center coordinate;
@@ -25,6 +26,10 @@ Return exactly one compact JSON object with exactly this structure:
 {"image_left_eye":{"bbox":[100,200,130,220],"state":"open"},"image_right_eye":{"bbox":[150,200,180,220],"state":"closed"}}
 Do not use a JSON array, bbox_2d, or label. Do not include explanations, markdown,
 or any additional fields.'''
+
+
+GENERATION_SEED = 42
+OPERATOR_SETTINGS = {'record_shapes': True, 'profile_memory': True, 'with_stack': False}
 
 
 def atomic_json(path, value):
@@ -63,43 +68,59 @@ def load_dataset(dataset, split):
 
 
 def read_config(path):
-    """JSON是唯一参数来源；只检查必填项及当前模式的关键参数关系。"""
+    """只读取真实实验变量；按模式/样本来源检查必填项，不合并默认配置。"""
     path = Path(path).resolve()
     config = json.loads(path.read_text(encoding='utf-8'))
-    required = {'dataset', 'out', 'model', 'mode', 'sample_count', 'sample_seed',
-                'sample_manifest', 'batch_sizes', 'gpu', 'warmup_batches', 'repeats',
-                'context_budget', 'max_new_tokens', 'seed', 'cpu_threads_per_worker',
-                'dp', 'profiler'}
+    obsolete = {'gpu', 'dp', 'profiler', 'seed'} & config.keys()
+    if obsolete:
+        raise ValueError('Obsolete config fields; migrate using SAMPLE_EVAL.md: ' + ', '.join(sorted(obsolete)))
+    required = {'dataset', 'out', 'model', 'mode', 'sample_manifest', 'batch_sizes',
+                'gpus', 'warmup_batches', 'context_budget', 'max_new_tokens', 'cpu_threads_per_worker'}
     missing = required - config.keys()
     if missing:
         raise ValueError('Missing config fields: ' + ', '.join(sorted(missing)))
     mode = config['mode']
-    if mode not in ('benchmark', 'profile'):
-        raise ValueError('mode must be benchmark or profile')
-    if config['sample_count'] < 1:
-        raise ValueError('sample_count must be positive')
+    if mode not in ('benchmark', 'timing', 'memory', 'operator'):
+        raise ValueError('mode must be benchmark, timing, memory or operator')
+    if config['sample_manifest'] is not None and (not isinstance(config['sample_manifest'], str) or not config['sample_manifest']):
+        raise ValueError('sample_manifest must be null or a nonempty path')
+    if not config['sample_manifest']:
+        required = {'sample_count', 'sample_seed'}
+        missing = required - config.keys()
+        if missing:
+            raise ValueError('Random sampling requires: ' + ', '.join(sorted(missing)))
+        if config['sample_count'] < 1:
+            raise ValueError('sample_count must be positive')
+    else:
+        # 清单决定本轮样本；不将未参与运行的随机抽样参数写成生效配置。
+        config.pop('sample_count', None)
+        config.pop('sample_seed', None)
     if min(config[k] for k in ('warmup_batches', 'context_budget', 'max_new_tokens', 'cpu_threads_per_worker')) < 1:
         raise ValueError('Warmup, token budgets and CPU threads must be positive')
     if config['max_new_tokens'] >= config['context_budget']:
         raise ValueError('max_new_tokens must be smaller than context_budget')
-    if not config['gpu'] or ',' in config['gpu']:
-        raise ValueError('gpu must identify exactly one GPU')
     sizes = config['batch_sizes']
-    if not sizes or sizes[0] != 1 or min(sizes) < 1 or sizes != sorted(set(sizes)):
-        raise ValueError('Increasing unique batch_sizes starting at 1 required')
+    if not sizes or min(sizes) < 1 or sizes != sorted(set(sizes)):
+        raise ValueError('Increasing positive unique batch_sizes required')
+    gpus = config['gpus']
+    if (not isinstance(gpus, list) or not gpus or
+            any(not isinstance(g, str) or not g or ',' in g for g in gpus) or len(set(gpus)) != len(gpus)):
+        raise ValueError('gpus must contain unique nonempty GPU ID/UUID strings')
     if mode == 'benchmark':
+        config.pop('capture_batches', None)
+        if len(gpus) == 1:
+            config.pop('dp_batch_size', None)
         if config['repeats'] < 1:
             raise ValueError('Positive repeats required')
-        dp = config['dp']
-        if type(dp['enabled']) is not bool:
-            raise ValueError('dp.enabled must be boolean')
-        if dp['enabled']:
-            gpus = dp['gpus']
-            if (len(gpus) < 2 or len(set(gpus)) != len(gpus) or
-                    any(not g or ',' in g for g in gpus) or gpus[0] != config['gpu'] or dp['batch_size'] not in sizes):
-                raise ValueError('DP requires unique GPUs, first GPU equal to gpu, and batch_size in batch_sizes')
-    if mode == 'profile' and config['profiler']['batches'] < 1:
-        raise ValueError('Profiler batches must be positive')
+        if len(gpus) > 1 and config['dp_batch_size'] not in sizes:
+            raise ValueError('dp_batch_size must be in batch_sizes for the single-GPU reference')
+    else:
+        config.pop('repeats', None)
+        config.pop('dp_batch_size', None)
+        if len(gpus) != 1:
+            raise ValueError('Timing, memory and operator diagnostics require exactly one GPU')
+        if config['capture_batches'] < 1:
+            raise ValueError('capture_batches must be positive')
     for key in ('dataset', 'out', 'model', 'sample_manifest'):
         if key == 'sample_manifest' and config[key] is None:
             continue
@@ -132,36 +153,85 @@ def generated_tokens(tokens, eos_ids, pad_id):
 
 
 @contextmanager
-def profile_stage(name, torch, measurements):
-    """同步划定阶段边界；峰值是进程allocator显存，包含模型及前阶段存活张量。
+def generation_profile(model, collector, operator=None):
+    """Qwen3.5非思考greedy生成的模块边界；仅挂局部hook，不改forward或generate。
 
-    只在profile模式重置峰值，不改变benchmark整轮峰值。reserved增量反映
-    allocator扩容，不能当作activation；算子内存净增量也不能替代阶段峰值。
+    视觉、语言主干和输出投影是相邻阶段，互不包含。语言阶段依据进入forward
+    前的缓存长度和输入长度识别；模块路径不匹配时显式失败，不退回调用次序猜测。
+    hook不保留输入/输出tensor；finally移除全部handle并关闭异常中的活动标记。
     """
-    torch.cuda.synchronize()
-    before = memory_stats(torch)
-    torch.cuda.reset_peak_memory_stats()
-    started = time.perf_counter()
+    modules = dict(model.named_modules())
+    paths = ('model.visual', 'model.language_model', 'lm_head')
+    if any(path not in modules for path in paths):
+        raise ValueError('Generation profiling requires Qwen3.5 visual/language_model/lm_head modules')
+    handles, active = [], {}
+    language_phase = None
+    language_step = 0
+
+    def before(module, args, kwargs):
+        nonlocal language_phase, language_step
+        path = next(path for path in paths if modules[path] is module)
+        metadata = {'module': path}
+        if path == 'model.language_model':
+            tensor = kwargs.get('inputs_embeds')
+            if tensor is None:
+                tensor = kwargs.get('input_ids')
+            if tensor is None:
+                raise ValueError('Cannot identify language input length')
+            length = tensor.shape[1]
+            cache = kwargs.get('past_key_values')
+            if cache is not None and not hasattr(cache, 'get_seq_length'):
+                raise ValueError('Cannot identify language cache length')
+            cached = int(cache.get_seq_length()) if cache is not None else 0
+            if cached == 0:
+                language_phase = 'language_prefill'
+            elif length == 1:
+                language_phase = 'language_decode'
+            else:
+                raise ValueError('Cached multi-token language call is outside greedy profiling contract')
+            name = language_phase
+            metadata.update(sequence_length=length, cached_tokens=cached, forward_index=language_step)
+            language_step += 1
+        elif path == 'model.visual':
+            name = 'vision'
+        else:
+            if language_phase is None:
+                raise ValueError('Output projection called before language forward')
+            name = 'prefill_logits' if language_phase == 'language_prefill' else 'decode_logits'
+            metadata['forward_index'] = language_step - 1
+        context = ExitStack()
+        try:
+            if operator is not None:
+                context.enter_context(operator.region('experiment/' + name))
+            if collector is not None:
+                context.enter_context(collector.measure(name, **metadata))
+        except BaseException:
+            context.close()
+            raise
+        active[module] = context
+
+    def after(module, args, kwargs, output):
+        context = active.pop(module, None)
+        if context is not None:
+            # 这三个目标模块成功时均返回非None；always_call让forward异常也关闭标记。
+            failure = RuntimeError('Profiled module forward did not return output') if output is None else None
+            context.__exit__(type(failure) if failure else None, failure, None)
+
     try:
-        with torch.profiler.record_function('pipeline/' + name):
-            yield
+        for path in paths:
+            module = modules[path]
+            handles.append(module.register_forward_pre_hook(before, with_kwargs=True))
+            handles.append(module.register_forward_hook(after, with_kwargs=True, always_call=True))
+        yield
     finally:
-        torch.cuda.synchronize()
-        after = memory_stats(torch)
-        measurements[name] = {
-            'elapsed_us': (time.perf_counter() - started) * 1e6,
-            'allocated_before_bytes': before['allocated_bytes'],
-            'allocated_after_bytes': after['allocated_bytes'],
-            'reserved_before_bytes': before['reserved_bytes'],
-            'reserved_after_bytes': after['reserved_bytes'],
-            'peak_allocated_bytes': after['peak_allocated_bytes'],
-            'peak_reserved_bytes': after['peak_reserved_bytes'],
-            'peak_allocated_increase_bytes': max(0, after['peak_allocated_bytes'] - before['allocated_bytes']),
-            'peak_reserved_increase_bytes': max(0, after['peak_reserved_bytes'] - before['reserved_bytes']),
-        }
+        for handle in handles:
+            handle.remove()
+        for context in active.values():
+            failure = RuntimeError('Generation profiling interrupted during module forward')
+            context.__exit__(type(failure), failure, None)
 
 
-def infer_batch(rows, model, processor, prompt, config, torch, profiling=False):
+def infer_batch(rows, model, processor, prompt, config, torch, profiling=False, operator=None):
     """一次真实batch generate；计时含读图、处理、传输、生成、输出解码，不含写盘。"""
     cases = {r['sample_id']: {'sample_id': r['sample_id'], 'image': r['image'],
                              'raw_output': None, 'status': 'failed'} for r in rows}
@@ -170,7 +240,29 @@ def infer_batch(rows, model, processor, prompt, config, torch, profiling=False):
     stage = 'image'
     torch.cuda.synchronize()
     started = time.perf_counter()
-    mark = lambda name: profile_stage(name, torch, stage_memory) if profiling else nullcontext()
+    # 三种测量互斥：普通计时不重置显存峰值，显存测量不启动算子追踪。
+    measurement = config['mode'] if profiling else None
+    pipeline_memory = MemoryProfiler(torch) if measurement == 'memory' else None
+
+    @contextmanager
+    def mark(name):
+        if not profiling and operator is None:
+            yield
+            return
+        try:
+            with ExitStack() as contexts:
+                if operator is not None:
+                    contexts.enter_context(operator.region('pipeline/' + name))
+                if pipeline_memory is not None:
+                    contexts.enter_context(pipeline_memory.measure(name))
+                yield
+        finally:
+            if pipeline_memory is not None and pipeline_memory.records:
+                record = pipeline_memory.records[-1]
+                if record['phase'] == name:
+                    stage_memory[name] = {key: value for key, value in record.items()
+                                          if key not in ('phase', 'metadata', 'status')}
+
     try:
         tick = time.perf_counter()
         with mark('read_images'):
@@ -179,7 +271,7 @@ def infer_batch(rows, model, processor, prompt, config, torch, profiling=False):
                     images.append(source.convert('RGB'))
         stages['read_images_us'] = (time.perf_counter() - tick) * 1e6
         batch = {'requested_images': len(rows), 'generated_images': 0, 'stage_us': stages}
-        if profiling:
+        if pipeline_memory is not None:
             batch['stage_memory'] = stage_memory
 
         stage = 'processor'
@@ -265,12 +357,6 @@ def runtime_context(torch, model, processor, gpu):
     }
 
 
-def memory_stats(torch):
-    return {'allocated_bytes': torch.cuda.memory_allocated(), 'reserved_bytes': torch.cuda.memory_reserved(),
-            'peak_allocated_bytes': torch.cuda.max_memory_allocated(),
-            'peak_reserved_bytes': torch.cuda.max_memory_reserved()}
-
-
 def write_cases(path, cases):
     path.write_text(''.join(json.dumps(case, ensure_ascii=False, allow_nan=False) + '\n'
                             for case in cases.values()), encoding='utf-8')
@@ -290,8 +376,8 @@ def worker(config, rows, gpu, batch_size, rank, output, barrier, profiling):
         if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
             raise ValueError('Expected exactly one visible CUDA GPU per worker')
         torch.set_num_threads(config['cpu_threads_per_worker'])
-        torch.manual_seed(config['seed'])
-        torch.cuda.manual_seed_all(config['seed'])
+        torch.manual_seed(GENERATION_SEED)
+        torch.cuda.manual_seed_all(GENERATION_SEED)
         torch.backends.cuda.matmul.allow_tf32 = False
         tick = time.perf_counter()
         processor = AutoProcessor.from_pretrained(config['model'], local_files_only=True)
@@ -313,51 +399,85 @@ def worker(config, rows, gpu, batch_size, rank, output, barrier, profiling):
         for index in range(config['warmup_batches']):
             infer_batch(batches[index % len(batches)], model, processor, prompt, config, torch)
         if profiling:
-            settings = config['profiler']
-            profiled_rows = rows[:batch_size * settings['batches']]
+            profiled_rows = rows[:batch_size * config['capture_batches']]
             measurements = []
-            result['profile_batches'] = measurements  # 故障时保留此前完成批次及失败阶段。
-            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                   torch.profiler.ProfilerActivity.CUDA],
-                                        record_shapes=settings['record_shapes'], profile_memory=settings['profile_memory'],
-                                        with_stack=settings['with_stack']) as profile:
+            target = config['mode']
+            result.update(measurement=target, profile_batches=measurements)
+            generation_reports = []
+            if target == 'timing':
+                result['generation_timing'] = generation_reports
+            # Operator窗口只在显式选择operator时创建；其他模式不调用torch.profiler。
+            profile = OperatorProfiler(torch, OPERATOR_SETTINGS) if target == 'operator' else None
+            with profile.capture() if profile is not None else nullcontext():
                 for start in range(0, len(profiled_rows), batch_size):
-                    cases, measurement = infer_batch(profiled_rows[start:start + batch_size], model, processor,
-                                           prompt, config, torch, profiling=True)
+                    collector = TimingProfiler(torch) if target == 'timing' else None
+                    try:
+                        hooks = generation_profile(model, collector, profile) if target != 'memory' else nullcontext()
+                        with hooks:
+                            cases, measurement = infer_batch(profiled_rows[start:start + batch_size], model, processor,
+                                                            prompt, config, torch, profiling=True, operator=profile)
+                    finally:
+                        if collector is not None:
+                            collector.resolve()
+                            generation_reports.append({'batch_index': len(measurements), **collector.report()})
                     current_cases.update(cases)
                     measurements.append(measurement)
-                    profile.step()
-            profile.export_chrome_trace(str(output / 'trace.json'))
-            operators = []
-            for event in profile.key_averages():
-                operators.append({
-                    'name': event.key, 'count': event.count,
-                    'cpu_total_us': event.cpu_time_total, 'self_cpu_us': event.self_cpu_time_total,
-                    'device_total_us': getattr(event, 'device_time_total', getattr(event, 'cuda_time_total', 0)),
-                    'self_device_us': getattr(event, 'self_device_time_total', getattr(event, 'self_cuda_time_total', 0)),
-                    'cpu_memory_bytes': event.cpu_memory_usage,
-                    'device_memory_bytes': getattr(event, 'device_memory_usage', getattr(event, 'cuda_memory_usage', 0)),
-                })
-            atomic_json(output / 'operators.json', sorted(operators, key=lambda op: op['self_device_us'], reverse=True))
+                    if profile is not None:
+                        profile.step()
+            if profile is not None:
+                profile.export(output)
             write_cases(output / 'profile_outputs.jsonl', current_cases)
-            # 按阶段汇总每批边界测量；尾批不混入完整batch的档位比较。
+            if target == 'memory':
+                # 生成内部峰值另跑，禁止嵌套pipeline显存区间；不会顺带采集算子。
+                result['generation_memory'] = generation_reports
+                for index, start in enumerate(range(0, len(profiled_rows), batch_size)):
+                    collector = MemoryProfiler(torch)
+                    try:
+                        with generation_profile(model, collector):
+                            memory_cases, _ = infer_batch(profiled_rows[start:start + batch_size], model, processor,
+                                                          prompt, config, torch, profiling=False)
+                    finally:
+                        generation_reports.append({'batch_index': index, **collector.report()})
+                    generation_reports[-1]['output_comparison'] = {
+                        'images': len(memory_cases),
+                        'different_raw_outputs': sum(memory_cases[sid]['raw_output'] != current_cases[sid]['raw_output']
+                                                     for sid in memory_cases),
+                        'pipeline_output_tokens': sum(current_cases[sid]['output_tokens'] for sid in memory_cases),
+                        'generation_output_tokens': sum(v['output_tokens'] for v in memory_cases.values()),
+                    }
+            if target != 'operator':
+                atomic_json(output / 'generation_profile.json', {
+                    'measurement': target, 'batches': generation_reports,
+                    'note': 'Selected measurement only. Memory synchronizes module boundaries and is not throughput. '
+                            'Module regions do not cover all of generate; peaks must not be added.',
+                })
             full_batches = [m for m in measurements if m['requested_images'] == batch_size]
             result['full_profile_batches'] = len(full_batches)
-            result['stage_summary'] = {
-                name: {
-                    'mean_elapsed_us': statistics.mean(m['stage_memory'][name]['elapsed_us'] for m in full_batches),
-                    'max_peak_allocated_bytes': max(m['stage_memory'][name]['peak_allocated_bytes'] for m in full_batches),
-                    'max_peak_reserved_bytes': max(m['stage_memory'][name]['peak_reserved_bytes'] for m in full_batches),
-                    'max_peak_allocated_increase_bytes': max(m['stage_memory'][name]['peak_allocated_increase_bytes'] for m in full_batches),
-                    'max_peak_reserved_increase_bytes': max(m['stage_memory'][name]['peak_reserved_increase_bytes'] for m in full_batches),
-                } for name in full_batches[0]['stage_memory']
-            }
-            # 总窗口峰值包含尾批；尾批可能因图像/token更长而占用更多显存。
-            result['profile_peak_allocated_bytes'] = max(v['peak_allocated_bytes'] for m in measurements for v in m['stage_memory'].values())
-            result['profile_peak_reserved_bytes'] = max(v['peak_reserved_bytes'] for m in measurements for v in m['stage_memory'].values())
-            result['allocated_headroom_bytes'] = result['runtime']['gpu_total_bytes'] - result['profile_peak_allocated_bytes']
+            result['stage_summary'] = {}
+            # 两类结果分别汇总，不在无显存测量时伪造峰值或headroom。
+            if target == 'timing':
+                # timing固定解释generate内部，基础pipeline耗时由benchmark负责。
+                calls = [call for report in generation_reports
+                         if measurements[report['batch_index']]['requested_images'] == batch_size
+                         for call in report['calls'] if call['status'] == 'complete']
+                result['stage_summary'] = {
+                    name: {'completed_calls': sum(c['phase'] == name for c in calls),
+                           'mean_host_elapsed_us': statistics.mean(c['host_elapsed_us'] for c in calls if c['phase'] == name),
+                           'mean_cuda_elapsed_us': statistics.mean(c['cuda_elapsed_us'] for c in calls if c['phase'] == name)}
+                    for name in dict.fromkeys(c['phase'] for c in calls)}
+            elif target == 'memory':
+                fields = ('peak_allocated_bytes', 'peak_reserved_bytes',
+                          'peak_allocated_increase_bytes', 'peak_reserved_increase_bytes')
+                result['stage_summary'] = {
+                    name: {'max_' + field: max(m['stage_memory'][name][field] for m in full_batches) for field in fields}
+                    for name in full_batches[0]['stage_memory']}
+                for field in ('peak_allocated_bytes', 'peak_reserved_bytes'):
+                    result['profile_' + field] = max(v[field] for m in measurements for v in m['stage_memory'].values())
+                result['allocated_headroom_bytes'] = result['runtime']['gpu_total_bytes'] - result['profile_peak_allocated_bytes']
             result.update(status='profile_complete', inference=summarize_inference(profiled_rows, current_cases),
-                          profiled_images=len(profiled_rows), note='Profiler timing and memory are diagnostic; shape/stack tracing can perturb execution and tensor lifetimes. Compare capacity with unprofiled benchmark peaks.')
+                          profiled_images=len(profiled_rows),
+                          note='Timing, memory and operator are separate runs. Use benchmark for stable throughput. '
+                               'Memory headroom excludes non-PyTorch allocations and other processes.')
         else:
             for repeat in range(config['repeats']):
                 current_cases, measurements = {}, []
@@ -382,6 +502,11 @@ def worker(config, rows, gpu, batch_size, rank, output, barrier, profiling):
                     gpu, batch_size, repeat + 1, config['repeats'], len(rows), observed['elapsed_us'] / 1e6), flush=True)
             result['status'] = 'complete'
     except Exception as exc:
+        if profiling and 'profile' in locals() and profile is not None:
+            try:
+                profile.export(output)
+            except Exception as export_error:
+                result['operator_export_error'] = str(export_error)
         result.update(status='oom' if type(exc).__name__ in ('OutOfMemoryError', 'CUDAOutOfMemoryError') else 'failed',
                       error='{}: {}'.format(type(exc).__name__, exc), traceback=traceback.format_exc())
         current_cases.update(getattr(exc, 'batch_cases', {}))
@@ -482,6 +607,15 @@ def launch(config, rows, gpus, batch_size, output, profiling=False):
                 'sample_ids_verified': True,
             })
             write_cases(output / ('outputs_r{}.jsonl'.format(repeat)), cases)
+        # benchmark始终报告基础计时；DP批统计跨rank池化，不等同全局批延迟。
+        windows = [r['global_pipeline_us'] for r in combined['repeats']]
+        observed_batches = [b for rank in results for repeat in rank['repeats'] for b in repeat['batches']]
+        combined['mean_global_pipeline_us'] = statistics.mean(windows)
+        combined['stdev_global_pipeline_us'] = statistics.stdev(windows) if len(windows) > 1 else 0.0
+        combined['mean_batch_pipeline_us'] = statistics.mean(b['pipeline_us'] for b in observed_batches)
+        combined['mean_stage_us_per_batch'] = {
+            name: statistics.mean(b['stage_us'][name] for b in observed_batches)
+            for name in observed_batches[0]['stage_us']}
         speeds = [r['generated_images_per_s'] for r in combined['repeats']]
         combined['mean_generated_images_per_s'] = statistics.mean(speeds)
         combined['stdev_generated_images_per_s'] = statistics.stdev(speeds) if len(speeds) > 1 else 0.0
@@ -511,23 +645,31 @@ def main():
         samples = frozen
     else:
         samples = select_samples(rows, config['sample_count'], config['sample_seed'])
-    if config['mode'] == 'profile' and len(samples) < max(config['batch_sizes']):
-        raise ValueError('Profile needs at least max(batch_sizes) samples; increase sample_count')
+    if config['mode'] != 'benchmark' and len(samples) < max(config['batch_sizes']):
+        raise ValueError('Diagnostics require at least max(batch_sizes) samples; enlarge the sample selection or reduce batch_sizes')
     out = Path(config['out'])
     out.mkdir(parents=True, exist_ok=False)  # 不覆盖已存在结果；每轮使用新输出目录。
-    atomic_json(out / 'config.json', {**config, 'prompt_template': PROMPT_TEMPLATE, 'coordinate_scale': 'norm1000'})
+    effective = {**config, 'generation_seed': GENERATION_SEED,
+                 'prompt_template': PROMPT_TEMPLATE, 'coordinate_scale': 'norm1000'}
+    if config['mode'] == 'operator':
+        effective['operator_settings'] = dict(OPERATOR_SETTINGS)
+    atomic_json(out / 'config.json', effective)
     (out / 'samples.jsonl').write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in samples), encoding='utf-8')
-    atomic_json(out / 'sample_info.json', {'selected_images': len(samples), 'validation_images': len(rows),
-        'sample_seed': config['sample_seed'], 'method': 'frozen_manifest' if config['sample_manifest'] else 'uniform_random_without_replacement'})
-    if config['mode'] == 'profile':
+    sample_info = {'selected_images': len(samples), 'validation_images': len(rows),
+                   'method': 'frozen_manifest' if config['sample_manifest'] else 'uniform_random_without_replacement'}
+    if not config['sample_manifest']:
+        sample_info['sample_seed'] = config['sample_seed']
+    atomic_json(out / 'sample_info.json', sample_info)
+    if config['mode'] != 'benchmark':
         # 相同batch档位/样本前缀与benchmark对齐；至少一整批才能证明该档真实容量。
         report = {'status': 'running', 'single_gpu': [], 'formal_baseline': False,
+                  'measurement': config['mode'],
                   'selection_note': 'Inference profile only; training needs backward/optimizer measurements. '
-                                    'Profiler latency includes instrumentation overhead. Allocator headroom excludes other processes and non-PyTorch allocations.'}
+                                    'Timing/memory scans precede optional operator tracing. Allocator headroom excludes other processes and non-PyTorch allocations.'}
         atomic_json(out / 'summary.json', report)
         try:
             for batch_size in config['batch_sizes']:
-                result = launch(config, samples, [config['gpu']], batch_size,
+                result = launch(config, samples, [config['gpus'][0]], batch_size,
                                 out / ('profile_b{}'.format(batch_size)), profiling=True)
                 report['single_gpu'].append(result)
                 atomic_json(out / 'summary.json', report)
@@ -551,25 +693,26 @@ def main():
     try:
         for batch_size in config['batch_sizes']:
             directory = out / ('single_b{}'.format(batch_size))
-            result = launch(config, samples, [config['gpu']], batch_size, directory)
+            result = launch(config, samples, [config['gpus'][0]], batch_size, directory)
             report['single_gpu'].append(result)
             if result['status'] != 'complete':
                 report.update(status='stopped', reason='OOM/runtime failure; larger batches not attempted')
                 break
-            speed_b1 = report['single_gpu'][0]['mean_generated_images_per_s']
+            reference = next((r for r in report['single_gpu'] if r['batch_size_per_gpu'] == 1), None)
+            speed_b1 = reference['mean_generated_images_per_s'] if reference else None
             result['speedup_vs_b1'] = result['mean_generated_images_per_s'] / speed_b1 if speed_b1 else None
             atomic_json(out / 'summary.json', report)
         else:
             report['status'] = 'complete'
-        if report['status'] == 'complete' and config['dp']['enabled']:
-            batch_size = config['dp']['batch_size']
-            dp = launch(config, samples, config['dp']['gpus'], batch_size, out / 'dp')
+        if report['status'] == 'complete' and len(config['gpus']) > 1:
+            batch_size = config['dp_batch_size']
+            dp = launch(config, samples, config['gpus'], batch_size, out / 'dp')
             report['dp'] = dp
             if dp['status'] == 'complete':
                 reference = next(r for r in report['single_gpu'] if r['batch_size_per_gpu'] == batch_size)
                 speed = reference['mean_generated_images_per_s']
                 dp['speedup_same_batch'] = dp['mean_generated_images_per_s'] / speed if speed else None
-                dp['efficiency_same_batch'] = dp['speedup_same_batch'] / len(config['dp']['gpus']) if speed else None
+                dp['efficiency_same_batch'] = dp['speedup_same_batch'] / len(config['gpus']) if speed else None
             else:
                 report['status'] = 'stopped'
         report['selection_note'] = 'Select using throughput variability, memory and trace; this experiment does not evaluate model accuracy.'

@@ -1,6 +1,6 @@
 # VLM 实验上下文快照
 
-同步日期：2026-10-08。用途：上下文压缩后的任务恢复，以及云端无法访问本地知识库时的有限上下文。不是云端实时状态报告，也不是完整实验记录副本。
+同步日期：2026-10-16。用途：上下文压缩后的任务恢复，以及云端无法访问本地知识库时的有限上下文。不是云端实时状态报告，也不是完整实验记录副本。
 
 ## 来源与当前步骤
 
@@ -9,7 +9,7 @@
 | 执行编号 | 对应设计 | 同步时状态 |
 |---|---|---|
 | S02-A | E1开发集抽样诊断 | 已有40图报告；属于诊断，不能充当正式baseline |
-| S02-B | 方案1.5.3推理效率实验 | 数据集已由用户人工确认构建完成，输入前置通过；batch/profiler/DP实验待执行 |
+| S02-B | 方案1.5.3推理效率实验 | 数据集构建已人工确认，单卡batch/五阶段profile已有实测；细粒度生成profile与DP验证待云端执行 |
 | S02-C | E1正式baseline | 等待效率实验确定执行配置，再做验证集全量评估 |
 | S03 | E2 targeted SFT/LoRA | 候选；正式baseline后决定质量训练 |
 
@@ -73,3 +73,33 @@
 用户后续约定：效率脚本仅保留benchmark和profile两种模式，两者自动选样并保存清单；复用样本通过sample_manifest指定已有samples.jsonl，无独立样本准备模式。
 
 2026-10-10实现更新：profile与benchmark共用JSON的batch_sizes（移除profiler.batch_size）；单卡逐档预热后采集读图、processor、H2D、generate、decode的耗时和allocated/reserved阶段峰值及入口增量，输出profile_b*/rank0的trace/算子统计、profile_batches和仅完整批stage_summary。普通benchmark保留整轮峰值和稳定吞吐。推理profile不能证明训练容量，微调候选仍需实测backward/optimizer step。本地结构验证不代表云端GPU实测。
+
+## 2026-10-13细粒度采集实现
+
+用户批准原推理入口加通用采集模块，兼顾后续LoRA训练。`src/experiment_profiler.py`提供torch.profiler算子窗口/trace导出和非嵌套阶段计时、显存测量；Qwen生成hook及缓存阶段识别保留在`src/s02_sample_eval.py`。JSON以`profiler.detail=pipeline/generation`选择粒度，显式读取，无内置默认值；batch列表可仅选16/32。细粒度计时/算子窗口与逐模块同步显存窗口分开，benchmark不安装hook。用法和训练复用接口见SAMPLE_EVAL.md，README保持原样。
+
+知识库记录1.4.5.2已报告单卡B16/B32吞吐约0.9333/0.9569图/s，allocated峰值34.04/50.54GiB；B16为DP验证优先候选，尚未确认compute-bound。上述为既有云端结果；新增细粒度采集尚无真实GPU验证，未实现LoRA训练或参数搜索，也未建立正式baseline。
+
+## 当前采集接口（2026-10-15）
+
+按用户批准的职责拆分，通用模块现为TimingProfiler.measure/resolve/report、MemoryProfiler.measure/report、OperatorProfiler.capture/region/step/export。移除ExperimentProfiler的measurement分支及重复的profile_stage/operator_profile函数。Timing不读取allocator，CUDA事件显式解析；Memory只同步采样及测峰值，禁止同设备嵌套。推理pipeline在调用侧组合两种测量并保留stage_memory字段，算子窗口独立标记区间并显式导出；Qwen生成识别仍留在推理脚本。JSON的benchmark/profile及profiler.detail开关不变，README不修改。
+
+本轮是接口重构和本地结构/模拟验证，无新增云端性能结果。后续LoRA循环可复用三种采集器，但训练循环和参数搜索仍未实现；用法见SAMPLE_EVAL.md。
+
+## 当前检查顺序与开关（2026-10-16）
+
+按用户明确的检查顺序，先benchmark，再对相同样本按batch列表分别进行timing和memory统计；存在瓶颈时才单独运行operator。mode仍为benchmark/profile，JSON新增必填profiler.measurement=timing/memory/operator，detail仍为pipeline/generation。示例JSON显式填写timing，不内置默认值、不自动触发其他采集器。
+
+timing/memory运行不启动torch.profiler，operator只采集算子及trace；生成内部memory仍需独立于pipeline峰值窗口。stage_timing与stage_memory分别保存，峰值/headroom仅memory输出，operator不附带这两类报告。记录measurement区分结果，不覆盖旧run。README不修改；无新增云端测量，使用说明以SAMPLE_EVAL.md为准。
+
+## benchmark基础计时职责
+
+benchmark不是只执行：每轮总耗时、每批耗时、五环节耗时、吞吐与波动均默认记录。配置级结果新增平均全局整轮耗时及标准差、平均批耗时、每批环节平均耗时，无需开启profile。DP批统计跨rank池化，不等同全局批延迟。profile/timing只增加可选的细粒度CUDA事件/生成区间诊断，memory及operator仍分别显式运行。
+
+## 当前配置合同（2026-10-16收敛）
+
+当前代码使用四种mode：benchmark/timing/memory/operator；取消用户可选的pipeline/generation粒度。benchmark固定基础pipeline计时与吞吐，timing固定生成内部计时，memory固定流程及独立生成模块峰值，operator固定流程/模块region和算子trace。三类诊断互相独立。
+
+GPU统一为gpus列表，多卡仅benchmark支持，dp_batch_size指定每卡batch并要求单卡扫描有同档参考。随机抽样才要求sample_count/sample_seed，sample_manifest路径复用清单时移除这两个无效字段；诊断必填capture_batches，benchmark必填repeats。生成seed=42、算子record_shapes/profile_memory开启及with_stack关闭固定在代码，并归档实际设置。旧gpu/dp/seed/profiler配置明确拒绝，不兼容静默回退。此前日期段落描述旧接口，当前使用说明以本节及SAMPLE_EVAL.md为准。
+
+本轮是配置及调用点收敛、本地结构与模拟验证；无新增云端测量，不修改README或原实验方案。
