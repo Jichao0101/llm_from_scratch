@@ -14,22 +14,8 @@ import time
 import traceback
 
 from experiment_profiler import MemoryProfiler, OperatorProfiler, TimingProfiler, memory_stats
-from PIL import Image
-PROMPT_TEMPLATE = '''Locate the driver's two eyes in this image.
-image_left_eye is the eye with the smaller horizontal box-center coordinate;
-image_right_eye has the larger coordinate. Use image positions, not anatomical left and right.
-For each eye, output bbox and state. Return tight boxes around the eye regions,
-not the eyebrows or the whole face.
-bbox must be [xmin,ymin,xmax,ymax] with integer coordinates normalized to 0..1000.
-state must be open, closed, narrow, or occluded. Use occluded when lighting, hair,
-or other factors prevent reliable classification as open, closed, or narrow.
-Return exactly one compact JSON object with exactly this structure:
-{"image_left_eye":{"bbox":[100,200,130,220],"state":"open"},"image_right_eye":{"bbox":[150,200,180,220],"state":"closed"}}
-Do not use a JSON array, bbox_2d, or label. Do not include explanations, markdown,
-or any additional fields.'''
-
-
-GENERATION_SEED = 42
+from s02_workload import (PROMPT_TEMPLATE, GENERATION_SEED, load_dataset, load_fixed_samples,
+                          load_model, make_prompt, load_images, prepare_inputs, generate)
 OPERATOR_SETTINGS = {'record_shapes': True, 'profile_memory': True, 'with_stack': False}
 
 
@@ -51,30 +37,13 @@ def summarize_inference(rows, cases):
     }
 
 
-def load_dataset(dataset, split):
-    dataset = Path(dataset)
-    meta = json.loads((dataset/'dataset.json').read_text())
-    if meta['status'] != 'built':
-        raise ValueError('Dataset is not successfully built')
-    info = meta['manifests'][split]
-    manifest = dataset/info['file']
-    rows = [json.loads(line) for line in manifest.read_text(encoding='utf-8').splitlines() if line.strip()]
-    if not rows or len({r['sample_id'] for r in rows}) != len(rows):
-        raise ValueError('Manifest must be nonempty with unique sample IDs')
-    if any(row['split'] != split for row in rows):
-        raise ValueError('Wrong split in manifest')
-    if any(not Path(row['image']).is_absolute() for row in rows):
-        raise ValueError('Manifest images must use absolute paths; rebuild dataset')
-    return meta, rows
-
-
 def read_config(path):
     """只读取真实实验变量；按模式/样本来源检查必填项，不合并默认配置。"""
     path = Path(path).resolve()
     config = json.loads(path.read_text(encoding='utf-8'))
     obsolete = {'gpu', 'dp', 'profiler', 'seed'} & config.keys()
     if obsolete:
-        raise ValueError('Obsolete config fields; migrate using SAMPLE_EVAL.md: ' + ', '.join(sorted(obsolete)))
+        raise ValueError('Unsupported config fields; see README.md: ' + ', '.join(sorted(obsolete)))
     required = {'dataset', 'out', 'model', 'mode', 'sample_manifest', 'batch_sizes',
                 'gpus', 'warmup_batches', 'context_budget', 'max_new_tokens', 'cpu_threads_per_worker'}
     missing = required - config.keys()
@@ -234,17 +203,14 @@ def infer_batch(rows, model, processor, prompt, config, torch, region=None):
     try:
         tick = time.perf_counter()
         with mark('read_images'):
-            for row in rows:
-                with Image.open(row['image']) as source:
-                    images.append(source.convert('RGB'))
+            images = load_images(rows)
         stages['read_images_us'] = (time.perf_counter() - tick) * 1e6
         batch = {'requested_images': len(rows), 'generated_images': 0, 'stage_us': stages}
 
         stage = 'processor'
         tick = time.perf_counter()
         with mark('processor'):
-            inputs = processor(text=[prompt] * len(images), images=images, return_tensors='pt',
-                               padding=True, truncation=False)
+            inputs = prepare_inputs(images, processor, prompt)
             width = inputs['input_ids'].shape[-1]
             # 不过滤样本、不缩小实际batch；预算不足时整份配置失败。
             stage = 'context_budget'
@@ -264,10 +230,8 @@ def infer_batch(rows, model, processor, prompt, config, torch, region=None):
         stages['host_to_device_us'] = (time.perf_counter() - tick) * 1e6
         stage = 'generate'
         tick = time.perf_counter()
-        with mark('generate'), torch.inference_mode():
-            outputs = model.generate(**inputs, max_new_tokens=config['max_new_tokens'], do_sample=False,
-                                     num_beams=1, use_cache=True, return_dict_in_generate=False,
-                                     pad_token_id=processor.tokenizer.pad_token_id)
+        with mark('generate'):
+            outputs = generate(model, processor, inputs, config['max_new_tokens'], torch)
             torch.cuda.synchronize()
         stages['generate_us'] = (time.perf_counter() - tick) * 1e6
         if outputs.shape[0] != len(rows):
@@ -448,6 +412,7 @@ def worker(config, rows, gpu, batch_size, rank, output, barrier):
         os.environ['HF_HUB_OFFLINE'] = '1'
         os.environ['TRANSFORMERS_OFFLINE'] = '1'
         import torch
+        # 保留模型类的提前导入，使首次解析实现仍在load_us计时之外。
         from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
         if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
             raise ValueError('Expected exactly one visible CUDA GPU per worker')
@@ -456,19 +421,12 @@ def worker(config, rows, gpu, batch_size, rank, output, barrier):
         torch.cuda.manual_seed_all(GENERATION_SEED)
         torch.backends.cuda.matmul.allow_tf32 = False
         tick = time.perf_counter()
-        processor = AutoProcessor.from_pretrained(config['model'], local_files_only=True)
-        processor.tokenizer.padding_side = 'left'
-        if processor.tokenizer.pad_token_id is None:
-            raise ValueError('Tokenizer needs an explicit pad token for batch generation')
-        model = Qwen3_5ForConditionalGeneration.from_pretrained(
-            config['model'], local_files_only=True, dtype=torch.bfloat16,
-            device_map={'': 0}, attn_implementation='sdpa').eval()
+        model, processor = load_model(config['model'], torch, attn_implementation='sdpa')
         torch.cuda.synchronize()
         result['load_us'] = (time.perf_counter() - tick) * 1e6
         result['runtime'] = runtime_context(torch, model, processor, gpu)
         result['loaded_memory'] = memory_stats(torch)
-        messages = [{'role': 'user', 'content': [{'type': 'image'}, {'type': 'text', 'text': PROMPT_TEMPLATE}]}]
-        prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        prompt = make_prompt(processor)
         batches = [rows[i:i + batch_size] for i in range(0, len(rows), batch_size)]
         # 首次调用单列，随后预热；预热失败也终止该配置，不能计入稳定吞吐。
         _, result['cold_batch'] = infer_batch(batches[0], model, processor, prompt, config, torch)
@@ -601,7 +559,8 @@ def launch(config, rows, gpus, batch_size, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', required=True, help='JSON file containing all experiment parameters')
+    parser.add_argument('--config', default=str(Path(__file__).resolve().with_suffix('.json')),
+                        help='JSON config (default: %(default)s)')
     args = parser.parse_args()
     config = read_config(args.config)
     meta, rows = load_dataset(config['dataset'], 'val')  
@@ -610,15 +569,7 @@ def main():
     if not Path(config['model']).is_dir():
         raise ValueError('Expected a local model directory; update config.model for this environment')
     if config['sample_manifest']:
-        frozen = [json.loads(line) for line in Path(config['sample_manifest']).read_text().splitlines() if line.strip()]
-        by_id = {row['sample_id']: row for row in rows}
-        if not frozen or len({r['sample_id'] for r in frozen}) != len(frozen):
-            raise ValueError('Frozen samples must be nonempty and unique')
-        for row in frozen:
-            current = by_id.get(row['sample_id'])
-            if current is None or current['image'] != row['image']:
-                raise ValueError('Frozen sample differs from current validation manifest')
-        samples = frozen
+        samples = load_fixed_samples(config['dataset'], config['sample_manifest'])
     else:
         samples = select_samples(rows, config['sample_count'], config['sample_seed'])
     if config['mode'] != 'benchmark' and len(samples) < max(config['batch_sizes']):

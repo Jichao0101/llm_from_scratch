@@ -1,6 +1,6 @@
 {
-  "dataset": "extract_data",
-  "out": "runs/sample_eval_benchmark_v1",
+  "dataset": "../datasets/baseline_v1",
+  "out": "../runs/sample_eval_benchmark_v1",
   "model": "/workspace/dms-eye-status-turbo/qwen_models/Qwen3.5-9B",
   "mode": "benchmark",
   "sample_count": 128,

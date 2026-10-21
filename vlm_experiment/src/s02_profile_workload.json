@@ -1,0 +1,14 @@
+{
+  "dataset": "../datasets/baseline_v1",
+  "sample_manifest": "../runs/sample_eval_benchmark_v1/samples.jsonl",
+  "model": "/workspace/dms-eye-status-turbo/qwen_models/Qwen3.5-9B",
+  "out": "../runs/ncu_workload_b16_v1",
+  "gpu": "0",
+  "batch_size": 16,
+  "warmup_batches": 2,
+  "capture_batches": 1,
+  "context_budget": 5600,
+  "max_new_tokens": 256,
+  "cpu_threads_per_worker": 4,
+  "attn_implementation": "sdpa"
+}
