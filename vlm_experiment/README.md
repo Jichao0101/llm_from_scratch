@@ -69,23 +69,29 @@ python src/s02_inspect_execution.py --trace
 
 ## s02_profile_workload.py：Nsight负载
 
-读取同一冻结清单，在每个待采集batch完整generate预热后，用NVTX `measure`标记生成及完成同步；输入准备和输出写盘位于范围外。默认配置与路径核验保持同一负载，使用独立out。
+读取同一冻结清单，在每个待采集batch完整generate预热后，用NVTX `measure`标记生成及完成同步；内部通过hook标记`vision`、`language_prefill`、`language_decode`及独立的`prefill_logits`/`decode_logits`。语言阶段按进入forward前的cache长度和输入长度判定，不按调用序号猜测；阶段之间不新增同步。输入准备、预热和输出写盘位于范围外。默认配置与路径核验保持同一负载，使用独立out。
 
 ```bash
 python src/s02_profile_workload.py
 ```
 
-确认负载可运行后，换新out采集。下面的TARGET_KERNEL须替换为实际目标，参数与权限以云端工具为准：
+已有torch.profiler trace用于定位热点；本轮以分阶段筛选后的代表性kernel做full采集，分析限制原因。先查云端`ncu --version`、`--list-sets`、`--list-sections`及计数器权限。每次运行使用新的JSON out和报告名。
+
+下面以vision为例；TARGET_KERNEL替换为trace核实的名称表达式。分析prefill时将范围改为`measure/language_prefill`，报告名相应改变：
 
 ```bash
-ncu --nvtx --nvtx-include 'measure/' \
+ncu --nvtx --nvtx-include 'measure/vision' \
   --kernel-name-base demangled --kernel-name 'regex:TARGET_KERNEL' \
-  --launch-count 1 \
-  --section SpeedOfLight --section LaunchStats --section Occupancy \
-  -o ncu_target_b16 python src/s02_profile_workload.py
+  --launch-count 1 --set full \
+  -o ncu_vision_b16 python src/s02_profile_workload.py
 ```
 
-输出workload.json，保留实际环境、样本、输入形状、图像网格与生成步数。launch-count限制匹配的kernel，不是batch数；同名kernel不保证来自同层。Roofline按实际精度和计算路径选择section，replay耗时不作为普通吞吐。当前观测尚不能确认计算或带宽饱和。
+- 先比较B1/B16：vision选同层同shape的attention；prefill选同层同投影的GEMM并核对矩阵规模。同名kernel不保证来自同层，必要时根据当前调用顺序设置`--launch-skip`，核对报告中的launch参数；不要套用历史序号。
+- `--launch-count`限制匹配的kernel实例，不是batch数。首次可将full改为basic，只采一个实例检查过滤与报告；不对整个generate重复做全量basic定位，也不对整个阶段的全部调用做full。
+- NVTX标记CPU提交范围。默认kernel replay下，阶段筛选仍生成逐kernel指标，不是阶段整体Roofline；不根据CPU标记跨度计算GPU阶段耗时。
+- full内容依云端版本和硬件而定。检查匹配精度/计算路径的Roofline、计算管线、各存储层级吞吐，再结合scheduler、eligible warps、依赖等待及spill判断；缺项按实际支持的section/metric补采。不能仅凭低occupancy或低DRAM带宽确定原因。
+
+输出workload.json，保留实际环境、样本、输入形状、图像网格与生成步数；ncu设置另随报告记录，特别是筛选、replay、缓存和时钟控制。采集会扰动执行，其耗时不作为普通吞吐；优化收益另用benchmark验证。逐图attention的调用分支仍由执行路径核验脚本确认，硬件指标不能证明后端不支持batch。
 
 ## s02_evaluate_baseline.py：正式质量评估
 

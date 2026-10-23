@@ -1,5 +1,6 @@
-"""固定S02生成负载，供ncu/nsys启动；NVTX measure仅覆盖预热后的generate。"""
+"""固定S02生成负载，供ncu/nsys启动；NVTX标记预热后的generate及其内部阶段。"""
 import argparse
+from contextlib import contextmanager
 import json
 import importlib.metadata
 import os
@@ -8,6 +9,67 @@ import traceback
 
 from s02_workload import (GENERATION_SEED, PROMPT_TEMPLATE, read_diagnostic_config,
                           load_fixed_samples, load_model, make_prompt, prepare_fixed_batch, generate)
+
+
+@contextmanager
+def _generation_nvtx_regions(model, nvtx):
+    """沿用sample_eval的Qwen3.5阶段判定；只标记提交范围，不同步GPU。
+
+    hook仅在采集窗口安装。模块或cache接口不匹配时失败，不按调用次数猜测；
+    不保存tensor，正常返回及异常退出均移除hook并关闭活动范围。
+    """
+    modules = dict(model.named_modules())
+    paths = ('model.visual', 'model.language_model', 'lm_head')
+    if any(path not in modules for path in paths):
+        raise ValueError('Generation profiling requires Qwen3.5 visual/language_model/lm_head modules')
+    handles, active = [], []
+    language_phase = None
+
+    def before(module, args, kwargs):
+        nonlocal language_phase
+        if module is modules['model.language_model']:
+            tensor = kwargs.get('inputs_embeds')
+            if tensor is None:
+                tensor = kwargs.get('input_ids')
+            if tensor is None:
+                raise ValueError('Cannot identify language input length')
+            cache = kwargs.get('past_key_values')
+            if cache is not None and not hasattr(cache, 'get_seq_length'):
+                raise ValueError('Cannot identify language cache length')
+            cached = int(cache.get_seq_length()) if cache is not None else 0
+            if cached == 0:
+                language_phase = 'language_prefill'
+            elif tensor.shape[1] == 1:
+                language_phase = 'language_decode'
+            else:
+                raise ValueError('Cached multi-token language call is outside greedy profiling contract')
+            name = language_phase
+        elif module is modules['model.visual']:
+            name = 'vision'
+        else:
+            if language_phase is None:
+                raise ValueError('Output projection called before language forward')
+            name = 'prefill_logits' if language_phase == 'language_prefill' else 'decode_logits'
+        nvtx.range_push(name)
+        active.append(module)
+
+    def after(module, args, kwargs, output):
+        if active and active[-1] is module:
+            active.pop()
+            nvtx.range_pop()
+
+    try:
+        for path in paths:
+            module = modules[path]
+            handles.append(module.register_forward_pre_hook(before, with_kwargs=True))
+            handles.append(module.register_forward_hook(after, with_kwargs=True, always_call=True))
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+        while active:
+            active.pop()
+            nvtx.range_pop()
 
 
 def main():
@@ -52,7 +114,8 @@ def main():
             torch.cuda.synchronize()
             torch.cuda.nvtx.range_push('measure')
             try:
-                outputs = generate(model, processor, inputs, config['max_new_tokens'], torch)
+                with _generation_nvtx_regions(model, torch.cuda.nvtx):
+                    outputs = generate(model, processor, inputs, config['max_new_tokens'], torch)
                 torch.cuda.synchronize()
             finally:
                 torch.cuda.nvtx.range_pop()
