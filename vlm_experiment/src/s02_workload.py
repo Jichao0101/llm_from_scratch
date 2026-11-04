@@ -35,20 +35,33 @@ def load_dataset(dataset, split):
 
 
 
-def load_fixed_samples(dataset, manifest):
-    """只接受既有val样本清单，保持其顺序，不重新抽样或改写图片路径。"""
-    meta, rows = load_dataset(dataset, 'val')
-    if meta['purpose'] != 'formal_baseline':
-        raise ValueError('GPU experiments require a formal_baseline manifest')
-    frozen = [json.loads(line) for line in Path(manifest).read_text().splitlines() if line.strip()]
-    by_id = {row['sample_id']: row for row in rows}
-    if not frozen or len({r['sample_id'] for r in frozen}) != len(frozen):
-        raise ValueError('Frozen samples must be nonempty and unique')
-    for row in frozen:
-        current = by_id.get(row['sample_id'])
-        if current is None or current['image'] != row['image']:
-            raise ValueError('Frozen sample differs from current validation manifest')
-    return frozen
+def load_fixed_samples(manifest):
+    """读取可迁移的val性能样本；image相对清单目录，运行时解析为绝对路径。"""
+    manifest = Path(manifest).resolve()
+    rows = [json.loads(line) for line in manifest.read_text(encoding='utf-8').splitlines() if line.strip()]
+    if not rows or any(not isinstance(row.get('sample_id'), str) or not row['sample_id'] for row in rows):
+        raise ValueError('Samples must be nonempty with nonempty string sample IDs')
+    if len({row['sample_id'] for row in rows}) != len(rows):
+        raise ValueError('Sample IDs must be unique')
+    images = set()
+    for row in rows:
+        if row.get('split') != 'val':
+            raise ValueError('Performance samples must come from the validation split')
+        if not isinstance(row.get('image'), str) or not row['image']:
+            raise ValueError('Each sample needs an image path')
+        image = Path(row['image'])
+        if image.is_absolute():
+            raise ValueError('Sample images must be relative to the manifest directory')
+        resolved = (manifest.parent / image).resolve()
+        if not resolved.is_relative_to(manifest.parent):
+            raise ValueError('Sample image must stay within the sample directory')
+        if not resolved.is_file():
+            raise FileNotFoundError(resolved)
+        if resolved in images:
+            raise ValueError('Sample image paths must be unique')
+        images.add(resolved)
+        row['image'] = str(resolved)
+    return rows
 
 
 def load_model(model_path, torch, *, attn_implementation):
@@ -104,7 +117,7 @@ def read_diagnostic_config(path):
     """两个短诊断入口共用固定负载配置，不接受原扫描器的mode/DP参数。"""
     path = Path(path).resolve()
     config = json.loads(path.read_text(encoding='utf-8'))
-    required = {'dataset', 'sample_manifest', 'model', 'out', 'gpu', 'batch_size',
+    required = {'sample_manifest', 'model', 'out', 'gpu', 'batch_size',
                 'warmup_batches', 'capture_batches', 'context_budget', 'max_new_tokens',
                 'cpu_threads_per_worker', 'attn_implementation'}
     if set(config) != required:
@@ -119,7 +132,7 @@ def read_diagnostic_config(path):
         raise ValueError('gpu must select exactly one device ID/UUID')
     if not isinstance(config['attn_implementation'], (str, dict)) or not config['attn_implementation']:
         raise ValueError('attn_implementation must be an explicit backend string or subconfig mapping')
-    for key in ('dataset', 'sample_manifest', 'model', 'out'):
+    for key in ('sample_manifest', 'model', 'out'):
         if not isinstance(config[key], str) or not config[key]:
             raise ValueError(key + ' must be a nonempty path')
         value = Path(config[key]).expanduser()

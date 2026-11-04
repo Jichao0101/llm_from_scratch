@@ -198,7 +198,7 @@ def main():
     parser.add_argument('--trace', action='store_true', help='Also capture short CPU/CUDA trace for association; adds overhead')
     args = parser.parse_args()
     config = read_diagnostic_config(args.config)
-    rows = load_fixed_samples(config['dataset'], config['sample_manifest'])
+    rows = load_fixed_samples(config['sample_manifest'])
     needed = config['batch_size'] * config['capture_batches']
     if len(rows) < needed:
         raise ValueError('Not enough frozen samples for complete capture batches')

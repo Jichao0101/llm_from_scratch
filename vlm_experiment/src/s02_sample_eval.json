@@ -1,11 +1,8 @@
 {
-  "dataset": "../datasets/baseline_v1",
   "out": "../runs/sample_eval_benchmark_v1",
-  "model": "/workspace/dms-eye-status-turbo/qwen_models/Qwen3.5-9B",
+  "model": "/workspace/dms-eye-status-turbo/qwen_models/Qwen3.5-4B",
   "mode": "benchmark",
-  "sample_count": 128,
-  "sample_seed": 20261008,
-  "sample_manifest": null,
+  "sample_manifest": "../samples/perf_32/samples.jsonl",
   "batch_sizes": [
     1,
     2,

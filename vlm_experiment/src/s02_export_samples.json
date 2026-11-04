@@ -1,0 +1,6 @@
+{
+  "dataset": "../datasets/baseline_v1",
+  "out": "../samples/perf_32",
+  "sample_count": 32,
+  "sample_seed": 20261008
+}

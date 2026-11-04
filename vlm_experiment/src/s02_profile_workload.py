@@ -1,9 +1,12 @@
-"""固定S02生成负载，供ncu/nsys启动；NVTX标记预热后的generate及其内部阶段。"""
+"""固定S02生成负载，供ncu/nsys启动；先basic核对调用清单，再full采集指定实例。"""
 import argparse
 from contextlib import contextmanager
 import json
 import importlib.metadata
 import os
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 import traceback
 
@@ -76,8 +79,44 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default=str(Path(__file__).resolve().with_suffix('.json')),
                         help='JSON config (default: %(default)s)')
-    config = read_diagnostic_config(parser.parse_args().config)
-    rows = load_fixed_samples(config['dataset'], config['sample_manifest'])
+    parser.add_argument('--ncu', choices=('basic', 'full'), help='由ncu启动同一负载；省略时直接运行')
+    parser.add_argument('--phase', choices=('vision', 'language_prefill', 'language_decode',
+                                          'prefill_logits', 'decode_logits'))
+    parser.add_argument('--kernel', help='ncu demangled名称过滤表达式，支持regex:前缀')
+    parser.add_argument('--launch-skip', type=int, help='显式填写当前过滤条件下跳过的匹配数，允许0')
+    parser.add_argument('--launch-count', type=int, help='显式填写待采集的连续匹配实例数')
+    parser.add_argument('--report', help='ncu报告路径/前缀，每次使用新名称')
+    parser.add_argument('--print-command', action='store_true', help='仅校验并打印ncu命令，不运行负载')
+    args = parser.parse_args()
+    selection = (args.phase, args.kernel, args.launch_skip, args.launch_count)
+    if args.ncu is None:
+        if args.print_command or args.report is not None or any(x is not None for x in selection):
+            parser.error('ncu options require --ncu basic/full')
+    else:
+        if not args.report or not args.report.strip():
+            parser.error('--ncu requires --report')
+        command = ['ncu', '--nvtx', '--kernel-name-base', 'demangled', '--set', args.ncu]
+        if args.ncu == 'basic':
+            if any(x is not None for x in selection):
+                parser.error('basic inventories all measure kernels; selection options are not allowed')
+            command += ['--nvtx-include', 'measure/']
+        else:
+            if any(x is None for x in selection) or not args.kernel.strip():
+                parser.error('full requires --phase, --kernel, --launch-skip and --launch-count')
+            if args.launch_skip < 0 or args.launch_count <= 0:
+                parser.error('full requires launch-skip >= 0 and launch-count > 0')
+            command += ['--nvtx-include', 'measure/' + args.phase,
+                        '--kernel-name', args.kernel, '--launch-skip', str(args.launch_skip),
+                        '--launch-count', str(args.launch_count)]
+        command += ['-o', args.report, sys.executable, str(Path(__file__).resolve()),
+                    '--config', str(Path(args.config).resolve())]
+        # 子进程不再传--ncu，避免递归启动；命令数组不经shell解释。
+        print(shlex.join(command), flush=True)
+        if not args.print_command:
+            raise SystemExit(subprocess.run(command, check=False).returncode)
+        return
+    config = read_diagnostic_config(args.config)
+    rows = load_fixed_samples(config['sample_manifest'])
     needed = config['batch_size'] * config['capture_batches']
     if len(rows) < needed:
         raise ValueError('Not enough frozen samples for complete capture batches')

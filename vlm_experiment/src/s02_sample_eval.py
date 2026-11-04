@@ -7,14 +7,13 @@ import json
 import multiprocessing as mp
 import os
 from pathlib import Path
-import random
 import statistics
 import sys
 import time
 import traceback
 
 from experiment_profiler import MemoryProfiler, OperatorProfiler, TimingProfiler, memory_stats
-from s02_workload import (PROMPT_TEMPLATE, GENERATION_SEED, load_dataset, load_fixed_samples,
+from s02_workload import (PROMPT_TEMPLATE, GENERATION_SEED, load_fixed_samples,
                           load_model, make_prompt, load_images, prepare_inputs, generate)
 OPERATOR_SETTINGS = {'record_shapes': True, 'profile_memory': True, 'with_stack': False}
 
@@ -41,10 +40,10 @@ def read_config(path):
     """只读取真实实验变量；按模式/样本来源检查必填项，不合并默认配置。"""
     path = Path(path).resolve()
     config = json.loads(path.read_text(encoding='utf-8'))
-    obsolete = {'gpu', 'dp', 'profiler', 'seed'} & config.keys()
+    obsolete = {'gpu', 'dp', 'profiler', 'seed', 'dataset', 'sample_count', 'sample_seed'} & config.keys()
     if obsolete:
         raise ValueError('Unsupported config fields; see README.md: ' + ', '.join(sorted(obsolete)))
-    required = {'dataset', 'out', 'model', 'mode', 'sample_manifest', 'batch_sizes',
+    required = {'out', 'model', 'mode', 'sample_manifest', 'batch_sizes',
                 'gpus', 'warmup_batches', 'context_budget', 'max_new_tokens', 'cpu_threads_per_worker'}
     missing = required - config.keys()
     if missing:
@@ -52,19 +51,8 @@ def read_config(path):
     mode = config['mode']
     if mode not in ('benchmark', 'timing', 'memory', 'operator'):
         raise ValueError('mode must be benchmark, timing, memory or operator')
-    if config['sample_manifest'] is not None and (not isinstance(config['sample_manifest'], str) or not config['sample_manifest']):
-        raise ValueError('sample_manifest must be null or a nonempty path')
-    if not config['sample_manifest']:
-        required = {'sample_count', 'sample_seed'}
-        missing = required - config.keys()
-        if missing:
-            raise ValueError('Random sampling requires: ' + ', '.join(sorted(missing)))
-        if config['sample_count'] < 1:
-            raise ValueError('sample_count must be positive')
-    else:
-        # 清单决定本轮样本；不将未参与运行的随机抽样参数写成生效配置。
-        config.pop('sample_count', None)
-        config.pop('sample_seed', None)
+    if not isinstance(config['sample_manifest'], str) or not config['sample_manifest']:
+        raise ValueError('sample_manifest must point to exported samples.jsonl')
     if min(config[k] for k in ('warmup_batches', 'context_budget', 'max_new_tokens', 'cpu_threads_per_worker')) < 1:
         raise ValueError('Warmup, token budgets and CPU threads must be positive')
     if config['max_new_tokens'] >= config['context_budget']:
@@ -91,18 +79,10 @@ def read_config(path):
             raise ValueError('Timing, memory and operator diagnostics require exactly one GPU')
         if config['capture_batches'] < 1:
             raise ValueError('capture_batches must be positive')
-    for key in ('dataset', 'out', 'model', 'sample_manifest'):
-        if key == 'sample_manifest' and config[key] is None:
-            continue
+    for key in ('out', 'model', 'sample_manifest'):
         target = Path(config[key]).expanduser()
         config[key] = str((target if target.is_absolute() else path.parent / target).resolve())
     return config
-
-
-def select_samples(rows, count, seed):
-    """按种子均匀随机无放回采样；排序仅使清单行重排不改变选样结果。"""
-    candidates = sorted(rows, key=lambda row: row['sample_id'])
-    return random.Random(seed).sample(candidates, min(count, len(candidates)))
 
 
 def split_samples(rows, workers):
@@ -563,15 +543,9 @@ def main():
                         help='JSON config (default: %(default)s)')
     args = parser.parse_args()
     config = read_config(args.config)
-    meta, rows = load_dataset(config['dataset'], 'val')  
-    if meta['purpose'] != 'formal_baseline':
-        raise ValueError('GPU experiments require a formal_baseline manifest')
+    samples = load_fixed_samples(config['sample_manifest'])
     if not Path(config['model']).is_dir():
         raise ValueError('Expected a local model directory; update config.model for this environment')
-    if config['sample_manifest']:
-        samples = load_fixed_samples(config['dataset'], config['sample_manifest'])
-    else:
-        samples = select_samples(rows, config['sample_count'], config['sample_seed'])
     if config['mode'] != 'benchmark' and len(samples) < max(config['batch_sizes']):
         raise ValueError('Diagnostics require at least max(batch_sizes) samples; enlarge the sample selection or reduce batch_sizes')
     out = Path(config['out'])
@@ -581,11 +555,10 @@ def main():
     if config['mode'] == 'operator':
         effective['operator_settings'] = dict(OPERATOR_SETTINGS)
     atomic_json(out / 'config.json', effective)
-    (out / 'samples.jsonl').write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in samples), encoding='utf-8')
-    sample_info = {'selected_images': len(samples), 'validation_images': len(rows),
-                   'method': 'frozen_manifest' if config['sample_manifest'] else 'uniform_random_without_replacement'}
-    if not config['sample_manifest']:
-        sample_info['sample_seed'] = config['sample_seed']
+    # 样本目录是可迁移输入；运行快照记录本机实际解析路径，不再充当下一轮输入。
+    atomic_json(out / 'resolved_samples.json', samples)
+    sample_info = {'selected_images': len(samples), 'method': 'exported_fixed_samples',
+                   'sample_manifest': config['sample_manifest']}
     atomic_json(out / 'sample_info.json', sample_info)
     report = {'status': 'running', 'mode': config['mode'], 'single_gpu': [], 'dp': None, 'formal_baseline': False}
     atomic_json(out / 'summary.json', report)

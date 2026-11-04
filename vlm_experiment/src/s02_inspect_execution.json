@@ -1,7 +1,6 @@
 {
-  "dataset": "../datasets/baseline_v1",
-  "sample_manifest": "../runs/sample_eval_benchmark_v1/samples.jsonl",
-  "model": "/workspace/dms-eye-status-turbo/qwen_models/Qwen3.5-9B",
+  "sample_manifest": "../samples/perf_32/samples.jsonl",
+  "model": "/workspace/dms-eye-status-turbo/qwen_models/Qwen3.5-4B",
   "out": "../runs/execution_inspect_b16_v1",
   "gpu": "0",
   "batch_size": 16,
