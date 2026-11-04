@@ -36,7 +36,7 @@ def load_dataset(dataset, split):
 
 
 def load_fixed_samples(manifest):
-    """读取可迁移的val性能样本；image相对清单目录，运行时解析为绝对路径。"""
+    """读取可迁移的固定性能样本；image相对清单目录，运行时解析为绝对路径。"""
     manifest = Path(manifest).resolve()
     rows = [json.loads(line) for line in manifest.read_text(encoding='utf-8').splitlines() if line.strip()]
     if not rows or any(not isinstance(row.get('sample_id'), str) or not row['sample_id'] for row in rows):
@@ -45,8 +45,6 @@ def load_fixed_samples(manifest):
         raise ValueError('Sample IDs must be unique')
     images = set()
     for row in rows:
-        if row.get('split') != 'val':
-            raise ValueError('Performance samples must come from the validation split')
         if not isinstance(row.get('image'), str) or not row['image']:
             raise ValueError('Each sample needs an image path')
         image = Path(row['image'])

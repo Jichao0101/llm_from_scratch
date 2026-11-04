@@ -7,7 +7,7 @@
 | 文件 | 用途 | 配置 |
 |---|---|---|
 | [s02_build_baseline_dataset.py](src/s02_build_baseline_dataset.py) | 构建数据清单 | 脚本内BUILD_SETTINGS与CLI |
-| [s02_export_samples.py](src/s02_export_samples.py) | 从完整验证集导出固定清单和原图 | [同名JSON](src/s02_export_samples.json) |
+| [s02_export_samples.py](src/s02_export_samples.py) | 从完整训练集导出固定清单和原图 | [同名JSON](src/s02_export_samples.json) |
 | [s02_sample_eval.py](src/s02_sample_eval.py) | 样本吞吐、batch/DP与阶段/算子测量 | [同名JSON](src/s02_sample_eval.json) |
 | [s02_inspect_execution.py](src/s02_inspect_execution.py) | 核验实际模型实现与attention路径 | [同名JSON](src/s02_inspect_execution.json) |
 | [s02_profile_workload.py](src/s02_profile_workload.py) | 为Nsight提供固定生成负载 | [同名JSON](src/s02_profile_workload.json) |
@@ -33,7 +33,7 @@ python src/s02_build_baseline_dataset.py \
 
 ## s02_export_samples.py：导出固定性能样本
 
-在完整dataset可访问的机器上，填写同名JSON中的dataset和out，默认从val均匀随机无放回抽取32张，seed为20261008。按sample_id排序后抽样，保留抽样顺序；样本不足32张时明确报错。修改数量需显式调整sample_count。
+在完整dataset可访问的机器上，填写同名JSON中的dataset和out，默认从train均匀随机无放回抽取32张，seed为20261008。按sample_id排序后抽样，保留抽样顺序；样本不足32张时明确报错。修改数量需显式调整sample_count。
 
 ```bash
 python src/s02_export_samples.py
@@ -50,13 +50,22 @@ samples/perf_32/
     └── ...
 ```
 
-原图按字节复制，不重新编码；清单保留sample_id、split及其他原字段，只将image改成`images/0001.jpg`这样的相对路径。sample_info.json记录抽样来源、seed和数量，其中source_dataset仅用于追溯，运行时不要求该目录存在。输出目录已存在时拒绝覆盖；导出失败时清理本次临时目录。
+原图按字节复制，不重新编码。样本数据与溯源统计分为两个文件，用sample_id关联：
 
-三个性能入口统一用sample_manifest指定导出的清单，图片路径始终相对清单目录解析，与启动目录无关。入口检查val归属、唯一ID、唯一图像路径和文件存在；完整验证集成员身份在导出时确认。旧运行结果里的绝对路径清单不再作为新输入。正式评估仍使用完整dataset。
+| 文件 | 内容与用途 |
+|---|---|
+| samples.jsonl | sample_id、相对image路径、width、height、gt_pixel、target_norm1000；图像与处理后的标注放在同一行，清单无需split |
+| sample_info.json | 抽样seed、数量、source_dataset、source_split，以及samples列表中的原图/原标注路径、已有SHA256、批次和场景等溯源信息 |
+
+标注沿用完整dataset中的原字段和坐标含义：gt_pixel为原图像素xyxy，target_norm1000为0～1000整数xyxy，导出时不重新计算。性能入口只使用sample_id和image，其余字段保留供训练或输出检查使用。溯源信息独立保存，不参与模型输入或评分；正式质量评估仍使用完整dataset。
+
+source_dataset和逐样本原路径仅用于追溯；迁移后运行只依赖samples.jsonl及images。输出目录已存在时拒绝覆盖；导出失败时清理本次临时目录。修改前已导出的目录保持原样，需要在新的out中重新导出才能得到这一布局。
+
+三个性能入口统一用sample_manifest指定导出的清单，图片路径始终相对清单目录解析，与启动目录无关。入口检查唯一ID、唯一图像路径和文件存在；训练集来源在导出时确认，运行时不依赖split字段。旧运行结果里的绝对路径清单不再作为新输入。正式评估仍使用完整dataset。
 
 ## s02_sample_eval.py：效率测量
 
-默认JSON为benchmark：读取导出的32张固定验证样本，扫描B1/2/4/8/16/32。不读取GT评分，不替代正式baseline。
+默认JSON为benchmark：读取导出的32张固定训练样本，扫描B1/2/4/8/16/32。不读取GT评分，不替代正式baseline。
 
 ```bash
 python src/s02_sample_eval.py
