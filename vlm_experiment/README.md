@@ -4,6 +4,12 @@
 
 ## 文件与启动约定
 
+| 入口 | 实验用途与输入 |
+|---|---|
+| [s01_memory_probe.py](src/s01_memory_probe.py) | 记录 BF16 权重加载前后显存、参数布局和显存快照。脚本顶层即加载模型；运行前检查文件内的模型路径、输出根目录和可见 GPU。 |
+| [s01_processor_probe.py](src/s01_processor_probe.py) | 在 CPU 上估算整图视觉 token、输入长度和生成预留。传入 `--model`、`--sample`、`--out-dir`；样本为含 `image` 和 `expected_detection` 的单样本 JSON。 |
+| [s01_single_reference_probe.py](src/s01_single_reference_probe.py) | 对一张参考图重复生成，检查原图像素坐标输出并记录时间与显存。复用时显式传入 `--model`、`--image`、`--gpu`、`--out`。 |
+
 | 文件 | 用途 | 配置 |
 |---|---|---|
 | [s02_build_baseline_dataset.py](src/s02_build_baseline_dataset.py) | 构建数据清单 | 脚本内BUILD_SETTINGS与CLI |
@@ -18,6 +24,8 @@
 四个JSON入口默认读取脚本自身目录中的同名`.json`，不依赖启动时的工作目录。也可用`--config /path/to/config.json`覆盖；JSON内部的相对路径始终基于该JSON目录。默认的是配置文件位置，实验参数仍要求显式填写。
 
 示例配置路径相对于src目录。导出脚本读取完整dataset；三个性能入口均读取`../samples/perf_32/samples.jsonl`，与benchmark输出目录独立。填写当前机器实际的4B模型目录和GPU，每轮使用新的out。以下命令从项目根目录执行。
+
+
 
 ## s02_build_baseline_dataset.py：构建数据
 
